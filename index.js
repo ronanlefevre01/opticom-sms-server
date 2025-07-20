@@ -23,7 +23,7 @@ app.post('/send-sms', async (req, res) => {
     accessToken: process.env.SMSMODE_API_KEY,
     message: message,
     numero: formattedNumber,
-    emetteur: 'Optique',
+    emetteur: 'OPTLEFEVRE',
   });
 
   try {
