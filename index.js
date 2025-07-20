@@ -24,6 +24,7 @@ app.post('/send-sms', async (req, res) => {
     message: message,
     numero: formattedNumber,
     emetteur: 'OPTLEFEVRE',
+    encoding: 'UTF-8' // ✅ Ajout pour gérer accents et caractères spéciaux
   });
 
   try {
