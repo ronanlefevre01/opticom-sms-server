@@ -19,13 +19,13 @@ app.post('/send-sms', async (req, res) => {
 
   const formattedNumber = phoneNumber.replace(/^0/, '+33');
 
-  const params = new URLSearchParams({
-  accessToken: process.env.SMSMODE_API_KEY,
-  message: message,
-  numero: formattedNumber,
-  emetteur: 'OPTLEFEVRE',
-  utf8: '1', // 💡 Ajout essentiel
-});
+  const params = new URLSearchParams();
+params.append('accessToken', process.env.SMSMODE_API_KEY);
+params.append('message', message);
+params.append('numero', formattedNumber);
+params.append('emetteur', 'OPTLEFEVRE');
+params.append('utf8', '1');  // ← essentiel pour déclarer l’encodage UTF‑8
+
 
 
   try {
