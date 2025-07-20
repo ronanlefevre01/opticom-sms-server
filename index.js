@@ -24,7 +24,6 @@ app.post('/send-sms', async (req, res) => {
     text: message,
     sender: senderLabel || process.env.OCTOPUSH_SENDER_DEFAULT,
     type: 'sms_premium',
-    purpose: 'alert',
     send_at: null,
     with_replies: false,
   };
