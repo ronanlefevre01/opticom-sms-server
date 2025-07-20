@@ -11,7 +11,7 @@ app.use(cors());
 app.use(bodyParser.json());
 
 app.post('/send-sms', async (req, res) => {
-  const { phoneNumber, message, senderLabel } = req.body;
+  const { phoneNumber, message } = req.body;
 
   if (!phoneNumber || !message) {
     return res.status(400).json({ success: false, error: 'Numéro ou message manquant.' });
@@ -19,46 +19,37 @@ app.post('/send-sms', async (req, res) => {
 
   const formattedNumber = phoneNumber.replace(/^0/, '+33');
 
-  const payload = {
-    recipients: [formattedNumber],
-    text: message,
-    sender: senderLabel || process.env.OCTOPUSH_SENDER_DEFAULT,
-    type: 'sms_premium',
-    send_at: null,
-    with_replies: false,
-  };
-
-  console.log('📦 Payload envoyé à Octopush :');
-  console.log(JSON.stringify(payload, null, 2));
+  const params = new URLSearchParams({
+    accessToken: process.env.SMSMODE_API_KEY,
+    message: message,
+    numero: formattedNumber,
+    emetteur: 'Optique',
+  });
 
   try {
-    const response = await fetch("https://api.octopush.com/v1/public/multi-channel/send", {
-      method: "POST",
+    const response = await fetch('https://api.smsmode.com/http/1.6/sendSMS.do', {
+      method: 'POST',
       headers: {
-        "Content-Type": "application/json",
-        "api-login": process.env.OCTOPUSH_USER_LOGIN,
-        "api-key": process.env.OCTOPUSH_API_KEY,
+        'Content-Type': 'application/x-www-form-urlencoded',
       },
-      body: JSON.stringify(payload),
+      body: params,
     });
 
-    const data = await response.json();
+    const text = await response.text();
 
-    console.log("📬 Réponse Octopush :", data);
-    console.log("👉 Demande d'envoi :", formattedNumber, message);
+    console.log('📨 Réponse SMSMode :', text);
 
-    if (response.ok && data.ticket_number) {
+    if (response.ok && !text.includes('error')) {
       return res.json({ success: true });
     } else {
-      console.error('❌ Erreur Octopush :', data);
-      return res.status(500).json({ success: false, error: data.message || 'Erreur lors de l’envoi.' });
+      return res.status(500).json({ success: false, error: text });
     }
   } catch (err) {
-    console.error('❗ Erreur réseau avec Octopush :', err);
-    res.status(500).json({ success: false, error: 'Erreur de communication avec Octopush.' });
+    console.error('❗ Erreur de communication avec SMSMode :', err);
+    res.status(500).json({ success: false, error: 'Erreur réseau.' });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`✅ Serveur SMS démarré sur http://localhost:${PORT}`);
+  console.log(`✅ Serveur SMSMode en ligne sur http://localhost:${PORT}`);
 });
