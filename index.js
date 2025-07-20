@@ -33,15 +33,22 @@ app.post('/send-sms', async (req, res) => {
   console.log(JSON.stringify(payload, null, 2));
 
   try {
-    const response = await fetch('https://api.octopush.com/v1/public/message-sms/send', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'api-key': process.env.OCTOPUSH_API_KEY,
-        'api-login': process.env.OCTOPUSH_USER_LOGIN,
-      },
-      body: JSON.stringify(payload),
-    });
+    const response = await fetch("https://api.octopush.com/v1/public/multi-channel/send", {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+    "api-login": process.env.OCTOPUSH_USER_LOGIN,
+    "api-key": process.env.OCTOPUSH_API_KEY,
+  },
+  body: JSON.stringify({
+    recipients: [phoneNumber],
+    text: messageText,
+    sender: senderName,
+    purpose: "alert",
+    type: "sms_premium",
+    with_replies: false,
+  }),
+});
 
     const data = await response.json();
 
