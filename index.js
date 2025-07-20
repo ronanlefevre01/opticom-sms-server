@@ -2,7 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const bodyParser = require('body-parser');
 const cors = require('cors');
-const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
+const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -34,28 +34,20 @@ app.post('/send-sms', async (req, res) => {
 
   try {
     const response = await fetch("https://api.octopush.com/v1/public/multi-channel/send", {
-  method: "POST",
-  headers: {
-    "Content-Type": "application/json",
-    "api-login": process.env.OCTOPUSH_USER_LOGIN,
-    "api-key": process.env.OCTOPUSH_API_KEY,
-  },
-  body: JSON.stringify({
-    recipients: [phoneNumber],
-    text: messageText,
-    sender: senderName,
-    purpose: "alert",
-    type: "sms_premium",
-    with_replies: false,
-  }),
-});
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "api-login": process.env.OCTOPUSH_USER_LOGIN,
+        "api-key": process.env.OCTOPUSH_API_KEY,
+      },
+      body: JSON.stringify(payload),
+    });
 
     const data = await response.json();
 
-    console.log('📬 Réponse Octopush :');
-    console.log(data);
+    console.log("📬 Réponse Octopush :", data);
     console.log("👉 Demande d'envoi :", formattedNumber, message);
-console.log("📨 Réponse Octopush :", data);
+
     if (response.ok && data.ticket_number) {
       return res.json({ success: true });
     } else {
