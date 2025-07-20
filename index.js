@@ -47,7 +47,8 @@ app.post('/send-sms', async (req, res) => {
 
     console.log('📬 Réponse Octopush :');
     console.log(data);
-
+    console.log("👉 Demande d'envoi :", formattedNumber, message);
+console.log("📨 Réponse Octopush :", data);
     if (response.ok && data.ticket_number) {
       return res.json({ success: true });
     } else {
