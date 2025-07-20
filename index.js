@@ -29,6 +29,9 @@ app.post('/send-sms', async (req, res) => {
     with_replies: false,
   };
 
+  console.log('📦 Payload envoyé à Octopush :');
+  console.log(JSON.stringify(payload, null, 2));
+
   try {
     const response = await fetch('https://api.octopush.com/v1/public/message-sms/send', {
       method: 'POST',
@@ -42,14 +45,17 @@ app.post('/send-sms', async (req, res) => {
 
     const data = await response.json();
 
+    console.log('📬 Réponse Octopush :');
+    console.log(data);
+
     if (response.ok && data.ticket_number) {
       return res.json({ success: true });
     } else {
-      console.error('Erreur Octopush :', data);
+      console.error('❌ Erreur Octopush :', data);
       return res.status(500).json({ success: false, error: data.message || 'Erreur lors de l’envoi.' });
     }
   } catch (err) {
-    console.error('Erreur réseau :', err);
+    console.error('❗ Erreur réseau avec Octopush :', err);
     res.status(500).json({ success: false, error: 'Erreur de communication avec Octopush.' });
   }
 });
