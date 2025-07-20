@@ -19,12 +19,13 @@ app.post('/send-sms', async (req, res) => {
 
   const formattedNumber = phoneNumber.replace(/^0/, '+33');
 
-  const params = new URLSearchParams();
-params.append('accessToken', process.env.SMSMODE_API_KEY);
-params.append('message', Buffer.from(message, 'utf-8').toString());
-params.append('numero', formattedNumber);
-params.append('emetteur', 'OPTLEFEVRE');
-params.append('encoding', 'UTF-8');
+  const params = new URLSearchParams({
+  accessToken: process.env.SMSMODE_API_KEY,
+  message: message,
+  numero: formattedNumber,
+  emetteur: 'OPTLEFEVRE',
+  utf8: '1', // 💡 Ajout essentiel
+});
 
 
   try {
