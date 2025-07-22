@@ -51,7 +51,7 @@ const response = await fetch(`${GO_CARDLESS_API_BASE}/redirect_flows`, {
     redirect_flows: {
       description: `Abonnement ${formule} - OptiCOM`,
       session_token,
-      success_redirect_url: 'opticom://merci',
+      success_redirect_url: 'https://opticom.vercel.app/merci',
       prefilled_customer: {
         given_name: prenom,
         family_name: nom,
