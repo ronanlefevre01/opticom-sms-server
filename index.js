@@ -4,7 +4,8 @@ const bodyParser = require('body-parser');
 const cors = require('cors');
 const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
 const { URLSearchParams } = require('url');
-const { Client } = require('gocardless-nodejs');
+const GoCardless = require('gocardless-nodejs');
+
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -17,7 +18,7 @@ app.get('/', (req, res) => {
 
 
 // === Config GoCardless ===
-const gcClient = new Client({
+const gcClient = new GoCardless.Client({
   access_token: process.env.GOCARDLESS_API_KEY,
   environment: 'live', // ou 'sandbox' si vous testez
 });
