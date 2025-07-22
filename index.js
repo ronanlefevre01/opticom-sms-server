@@ -18,10 +18,8 @@ app.get('/', (req, res) => {
 
 
 // === Config GoCardless ===
-const gcClient = new GoCardless.Client({
-  access_token: process.env.GOCARDLESS_API_KEY,
-  environment: 'live', // ou 'sandbox' si vous testez
-});
+const GO_CARDLESS_API_BASE = 'https://api.gocardless.com';
+
 
 // === Créer un mandat GoCardless ===
 app.post('/create-mandat', async (req, res) => {
@@ -40,28 +38,47 @@ app.post('/create-mandat', async (req, res) => {
 
   try {
     // 🔐 Création du Redirect Flow GoCardless
-    const flow = await gcClient.redirectFlows.create({
-      params: {
-        description: `Abonnement ${formule} - OptiCOM`,
-        session_token: email + Date.now(),
-        success_redirect_url: 'opticom://merci',
-        prefilled_customer: {
-          given_name: prenom,
-          family_name: nom,
-          email,
-          address_line1: adresse,
-          city: ville,
-          postal_code: codePostal,
-          country_code: pays && pays.length === 2 ? pays.toUpperCase() : 'FR',
-        },
-        enabled_notifications: [], // 🔕 Aucune notification automatique GoCardless
-        metadata: {
-          formule,
-          siret,
-          telephone,
-        },
+    const session_token = email + Date.now();
+
+const response = await fetch(`${GO_CARDLESS_API_BASE}/redirect_flows`, {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${process.env.GOCARDLESS_API_KEY}`,
+    'GoCardless-Version': '2015-07-06' // requis par l'API GoCardless
+  },
+  body: JSON.stringify({
+    redirect_flows: {
+      description: `Abonnement ${formule} - OptiCOM`,
+      session_token,
+      success_redirect_url: 'opticom://merci',
+      prefilled_customer: {
+        given_name: prenom,
+        family_name: nom,
+        email,
+        address_line1: adresse,
+        city: ville,
+        postal_code: codePostal,
+        country_code: pays && pays.length === 2 ? pays.toUpperCase() : 'FR',
       },
-    });
+      metadata: {
+        formule,
+        siret,
+        telephone,
+      }
+    }
+  })
+});
+
+if (!response.ok) {
+  const errorText = await response.text();
+  console.error('❗ Erreur GoCardless :', errorText);
+  return res.status(500).json({ error: 'Erreur GoCardless. Vérifiez vos infos.' });
+}
+
+const data = await response.json();
+res.json({ url: data.redirect_flows.redirect_url });
+
 
     // 🔁 Rediriger vers l’URL de signature
     res.json({ url: flow.redirect_url });
