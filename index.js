@@ -11,6 +11,10 @@ const PORT = process.env.PORT || 3001;
 
 app.use(cors());
 app.use(bodyParser.json());
+app.get('/', (req, res) => {
+  res.send('✅ Serveur OptiCOM en ligne');
+});
+
 
 // === Config GoCardless ===
 const gcClient = new Client({
@@ -47,7 +51,7 @@ app.post('/create-mandat', async (req, res) => {
           address_line1: adresse,
           city: ville,
           postal_code: codePostal,
-          country_code: pays || 'FR',
+          country_code: pays && pays.length === 2 ? pays.toUpperCase() : 'FR',
         },
         enabled_notifications: [], // 🔕 Aucune notification automatique GoCardless
         metadata: {
@@ -80,7 +84,7 @@ app.post('/send-sms', async (req, res) => {
   params.append('accessToken', process.env.SMSMODE_API_KEY);
   params.append('message', message);
   params.append('numero', formattedNumber);
-  params.append('emetteur', senderLabel || 'Opticien');
+  params.append('emetteur', emetteur || 'Opticien');
   params.append('utf8', '1');
   params.append('charset', 'UTF-8');
 
