@@ -175,6 +175,56 @@ app.post('/send-sms', async (req, res) => {
   }
 });
 
+// === Achat de crédits via GoCardless (clients abonnés) ===
+app.post('/achat-credits-gocardless', async (req, res) => {
+  const { email, quantity } = req.body;
+  const qty = Math.max(1, parseInt(quantity || '1'));
+
+  try {
+    const licences = fs.existsSync('./licences.json') ? JSON.parse(fs.readFileSync('./licences.json', 'utf-8')) : [];
+    const index = licences.findIndex(l => l.email === email);
+
+    if (index === -1) {
+      return res.status(404).json({ error: "Licence introuvable" });
+    }
+
+    const mandate = licences[index].mandate;
+
+    const response = await fetch(`${GO_CARDLESS_API_BASE}/payments`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.GOCARDLESS_API_KEY}`,
+        'GoCardless-Version': '2015-07-06'
+      },
+      body: JSON.stringify({
+        payments: {
+          amount: 6 * qty * 100, // 0,06€ x 100 x qty => en centimes
+          currency: 'EUR',
+          links: { mandate },
+          description: `Achat ponctuel de ${qty * 100} crédits SMS - OptiCOM`,
+          metadata: { email, type: 'achat-credits', quantity: qty.toString() }
+        }
+      })
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      console.error('❗ Erreur paiement GoCardless :', data);
+      return res.status(500).json({ error: 'Paiement échoué' });
+    }
+
+    licences[index].credits += qty * 100;
+    fs.writeFileSync('./licences.json', JSON.stringify(licences, null, 2));
+
+    res.json({ success: true, creditsAjoutes: qty * 100 });
+  } catch (err) {
+    console.error('❗ Erreur achat GoCardless :', err);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
 // === Créer une session Stripe ===
 app.post('/create-checkout-session', async (req, res) => {
   const { clientEmail, quantity } = req.body;
@@ -194,7 +244,7 @@ app.post('/create-checkout-session', async (req, res) => {
           quantity: qty,
         },
       ],
-      success_url: 'opticom://merci-achat?session_id={CHECKOUT_SESSION_ID}',
+      success_url: `opticom://merci-achat?credits=${qty * 100}`,
       cancel_url: 'opticom://annulation-achat',
       metadata: {
         email: clientEmail || '',
