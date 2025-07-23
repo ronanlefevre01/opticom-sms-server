@@ -8,7 +8,8 @@ const { URLSearchParams } = require('url');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
-const GO_CARDLESS_API_BASE = 'https://api.gocardless.com';
+const GO_CARDLESS_API_BASE = 'https://api-sandbox.gocardless.com';
+
 
 app.use(cors());
 app.use(bodyParser.json());
