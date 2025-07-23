@@ -5,15 +5,17 @@ const cors = require('cors');
 const fs = require('fs');
 const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
 const { URLSearchParams } = require('url');
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 const GO_CARDLESS_API_BASE = 'https://api-sandbox.gocardless.com';
 
-
 app.use(cors());
 app.use(bodyParser.json());
+app.use('/webhook-stripe', express.raw({ type: 'application/json' }));
 
+// === Accueil ===
 app.get('/', (req, res) => {
   res.send('✅ Serveur OptiCOM en ligne');
 });
@@ -21,16 +23,8 @@ app.get('/', (req, res) => {
 // === Créer un mandat GoCardless ===
 app.post('/create-mandat', async (req, res) => {
   const {
-    nom,
-    prenom,
-    email,
-    adresse,
-    ville,
-    codePostal,
-    pays,
-    formule,
-    siret,
-    telephone
+    nom, prenom, email, adresse, ville,
+    codePostal, pays, formule, siret, telephone
   } = req.body;
 
   try {
@@ -58,21 +52,19 @@ app.post('/create-mandat', async (req, res) => {
             country_code: pays && pays.length === 2 ? pays.toUpperCase() : 'FR',
           },
           metadata: {
-            formule,
-            siret,
-            telephone,
+            formule, siret, telephone,
           }
         }
       })
     });
 
+    const data = await response.json();
+
     if (!response.ok) {
-      const errorText = await response.text();
-      console.error('❗ Erreur GoCardless :', errorText);
+      console.error('❗ Erreur GoCardless :', data);
       return res.status(500).json({ error: 'Erreur GoCardless. Vérifiez vos infos.' });
     }
 
-    const data = await response.json();
     res.json({ url: data.redirect_flows.redirect_url });
 
   } catch (err) {
@@ -97,11 +89,7 @@ app.post('/confirm-mandat', async (req, res) => {
         'GoCardless-Version': '2015-07-06',
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({
-        data: {
-          session_token: redirect_flow_id // on simplifie pour le test
-        }
-      })
+      body: JSON.stringify({ data: { session_token: redirect_flow_id } })
     });
 
     const data = await response.json();
@@ -124,6 +112,7 @@ app.post('/confirm-mandat', async (req, res) => {
       siret: info.metadata.siret,
       customer,
       mandate,
+      credits: 0,
       createdAt: new Date().toISOString(),
     };
 
@@ -185,10 +174,11 @@ app.post('/send-sms', async (req, res) => {
     res.status(500).json({ success: false, error: 'Erreur réseau.' });
   }
 });
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
+// === Créer une session Stripe ===
 app.post('/create-checkout-session', async (req, res) => {
-  const { clientEmail } = req.body;
+  const { clientEmail, quantity } = req.body;
+  const qty = Math.max(1, parseInt(quantity || '1'));
 
   try {
     const session = await stripe.checkout.sessions.create({
@@ -198,18 +188,17 @@ app.post('/create-checkout-session', async (req, res) => {
         {
           price_data: {
             currency: 'eur',
-            product_data: {
-              name: 'Crédits SMS OptiCOM (lot de 100)',
-            },
-            unit_amount: 1700, // 17€ HT
+            product_data: { name: 'Crédits SMS OptiCOM (lot de 100)' },
+            unit_amount: 1700,
           },
-          quantity: 1,
+          quantity: qty,
         },
       ],
       success_url: 'opticom://merci-achat?session_id={CHECKOUT_SESSION_ID}',
       cancel_url: 'opticom://annulation-achat',
       metadata: {
         email: clientEmail || '',
+        quantity: qty.toString(),
       },
     });
 
@@ -220,7 +209,43 @@ app.post('/create-checkout-session', async (req, res) => {
   }
 });
 
+// === Webhook Stripe pour ajout de crédits ===
+app.post('/webhook-stripe', (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
+  let event;
 
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, endpointSecret);
+  } catch (err) {
+    console.error('❌ Erreur de signature Stripe :', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    const email = session.metadata?.email;
+    const quantity = parseInt(session.metadata?.quantity || '1');
+
+    if (!email) return res.status(200).send('OK');
+
+    const path = './licences.json';
+    let licences = fs.existsSync(path) ? JSON.parse(fs.readFileSync(path, 'utf-8')) : [];
+    const index = licences.findIndex(l => l.email === email);
+
+    if (index !== -1) {
+      licences[index].credits = (licences[index].credits || 0) + (100 * quantity);
+      fs.writeFileSync(path, JSON.stringify(licences, null, 2));
+      console.log(`✅ ${100 * quantity} crédits ajoutés à ${email}`);
+    } else {
+      console.warn(`⚠️ Aucune licence trouvée pour ${email}`);
+    }
+  }
+
+  res.status(200).send('OK');
+});
+
+// === Lancement serveur ===
 app.listen(PORT, () => {
   console.log(`✅ Serveur prêt sur http://localhost:${PORT}`);
 });
