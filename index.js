@@ -185,6 +185,41 @@ app.post('/send-sms', async (req, res) => {
     res.status(500).json({ success: false, error: 'Erreur réseau.' });
   }
 });
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+
+app.post('/create-checkout-session', async (req, res) => {
+  const { clientEmail } = req.body;
+
+  try {
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      mode: 'payment',
+      line_items: [
+        {
+          price_data: {
+            currency: 'eur',
+            product_data: {
+              name: 'Crédits SMS OptiCOM (lot de 100)',
+            },
+            unit_amount: 1700, // 17€ HT
+          },
+          quantity: 1,
+        },
+      ],
+      success_url: 'opticom://merci-achat?session_id={CHECKOUT_SESSION_ID}',
+      cancel_url: 'opticom://annulation-achat',
+      metadata: {
+        email: clientEmail || '',
+      },
+    });
+
+    res.json({ url: session.url });
+  } catch (error) {
+    console.error('❗Erreur Stripe:', error);
+    res.status(500).json({ error: 'Erreur lors de la création de la session Stripe.' });
+  }
+});
+
 
 app.listen(PORT, () => {
   console.log(`✅ Serveur prêt sur http://localhost:${PORT}`);
