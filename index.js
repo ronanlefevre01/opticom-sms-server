@@ -295,6 +295,10 @@ app.post('/webhook-stripe', (req, res) => {
   res.status(200).send('OK');
 });
 
+// === Rendre le fichier licences.json accessible publiquement ===
+const path = require('path');
+app.use('/licences.json', express.static(path.join(__dirname, 'licences.json')));
+
 // === Lancement serveur ===
 app.listen(PORT, () => {
   console.log(`✅ Serveur prêt sur http://localhost:${PORT}`);
