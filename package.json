@@ -17,7 +17,9 @@
     "cors": "^2.8.5",
     "dotenv": "^17.2.0",
     "express": "^5.1.0",
-    "node-fetch": "^3.3.2"
+    "node-fetch": "^3.3.2",
+    "raw-body": "^3.0.0",
+    "stripe": "^18.3.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.0"
