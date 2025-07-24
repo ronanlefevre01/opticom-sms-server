@@ -1,15 +1,25 @@
+// index.js corrigé et amélioré
 require('dotenv').config();
 const express = require('express');
 const bodyParser = require('body-parser');
 const cors = require('cors');
 const fs = require('fs');
+const path = require('path');
 const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
 const { URLSearchParams } = require('url');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const PDFDocument = require('pdfkit');
+const { v4: uuidv4 } = require('uuid');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 const GO_CARDLESS_API_BASE = 'https://api-sandbox.gocardless.com';
+
+// Créer le dossier public/factures s'il n'existe pas
+const factureDir = path.join(__dirname, 'public/factures');
+if (!fs.existsSync(factureDir)) {
+  fs.mkdirSync(factureDir, { recursive: true });
+}
 
 app.use(cors());
 app.use(bodyParser.json());
@@ -104,6 +114,7 @@ app.post('/confirm-mandat', async (req, res) => {
     const info = data.redirect_flow;
 
     const licence = {
+      id: uuidv4(),
       nom: info.prefilled_customer.given_name,
       prenom: info.prefilled_customer.family_name,
       email: info.prefilled_customer.email,
@@ -199,7 +210,7 @@ app.post('/achat-credits-gocardless', async (req, res) => {
       },
       body: JSON.stringify({
         payments: {
-          amount: 6 * qty * 100, // 0,06€ x 100 x qty => en centimes
+          amount: 6 * qty * 100,
           currency: 'EUR',
           links: { mandate },
           description: `Achat ponctuel de ${qty * 100} crédits SMS - OptiCOM`,
@@ -217,6 +228,27 @@ app.post('/achat-credits-gocardless', async (req, res) => {
 
     licences[index].credits += qty * 100;
     fs.writeFileSync('./licences.json', JSON.stringify(licences, null, 2));
+
+    // Génération automatique de la facture PDF
+    const facturePayload = {
+      opticien: licences[index],
+      type: 'Achat de crédits SMS (GoCardless)',
+      montant: 6 * qty,
+      details: `${qty * 100} crédits achetés`
+    };
+
+    fetch(`http://localhost:${PORT}/api/generate-invoice`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(facturePayload)
+    })
+    .then(res => res.json())
+    .then(data => {
+      console.log(`📄 Facture générée : ${data.url}`);
+    })
+    .catch(err => {
+      console.error('❌ Erreur génération facture GoCardless :', err);
+    });
 
     res.json({ success: true, creditsAjoutes: qty * 100 });
   } catch (err) {
@@ -279,27 +311,103 @@ app.post('/webhook-stripe', (req, res) => {
 
     if (!email) return res.status(200).send('OK');
 
-    const path = './licences.json';
-    let licences = fs.existsSync(path) ? JSON.parse(fs.readFileSync(path, 'utf-8')) : [];
+    const pathLic = './licences.json';
+    let licences = fs.existsSync(pathLic) ? JSON.parse(fs.readFileSync(pathLic, 'utf-8')) : [];
     const index = licences.findIndex(l => l.email === email);
 
     if (index !== -1) {
       licences[index].credits = (licences[index].credits || 0) + (100 * quantity);
-      fs.writeFileSync(path, JSON.stringify(licences, null, 2));
+      fs.writeFileSync(pathLic, JSON.stringify(licences, null, 2));
       console.log(`✅ ${100 * quantity} crédits ajoutés à ${email}`);
-    } else {
-      console.warn(`⚠️ Aucune licence trouvée pour ${email}`);
+
+      // Génération de la facture
+      const facturePayload = {
+        opticien: licences[index],
+        type: 'Achat de crédits SMS (Stripe)',
+        montant: 17 * quantity,
+        details: `${100 * quantity} crédits achetés`
+      };
+
+      fetch(`http://localhost:${PORT}/api/generate-invoice`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(facturePayload)
+      })
+      .then(r => r.json())
+      .then(data => console.log(`📄 Facture générée : ${data.url}`))
+      .catch(err => console.error('❌ Erreur facture Stripe :', err));
     }
   }
 
   res.status(200).send('OK');
 });
 
-// === Rendre le fichier licences.json accessible publiquement ===
-const path = require('path');
+// === Servir les factures et licences ===
+app.use('/factures', express.static(path.join(__dirname, 'public/factures')));
 app.use('/licences.json', express.static(path.join(__dirname, 'licences.json')));
+
+// === Génération d'une facture PDF ===
+app.post('/api/generate-invoice', (req, res) => {
+  const { opticien, type, montant, details } = req.body;
+
+  if (!opticien || !opticien.id) {
+    return res.status(400).json({ error: 'Opticien manquant ou invalide' });
+  }
+
+  const fileName = `facture-${opticien.id}-${uuidv4()}.pdf`;
+  const filePath = path.join(__dirname, 'public/factures', fileName);
+
+  const doc = new PDFDocument();
+  const stream = fs.createWriteStream(filePath);
+  doc.pipe(stream);
+
+  doc.fontSize(20).text('📄 Facture OptiCOM', { align: 'center' });
+  doc.moveDown();
+  doc.fontSize(12).text(`Nom : ${opticien.nom}`);
+  doc.text(`SIRET : ${opticien.siret}`);
+  doc.text(`Email : ${opticien.email}`);
+  doc.text(`Téléphone : ${opticien.telephone}`);
+  doc.moveDown();
+  doc.text(`Type de facture : ${type}`);
+  doc.text(`Montant TTC : ${montant.toFixed(2)} €`);
+  doc.text(`Détails : ${details}`);
+  doc.text(`Date : ${new Date().toLocaleDateString('fr-FR')}`);
+  doc.end();
+
+  stream.on('finish', () => {
+  try {
+    const licencesPath = path.join(__dirname, 'licences.json');
+    const licences = JSON.parse(fs.readFileSync(licencesPath, 'utf-8'));
+
+    const index = licences.findIndex(l => l.id === opticien.id);
+    if (index !== -1) {
+      if (!licences[index].factures) {
+        licences[index].factures = [];
+      }
+
+      licences[index].factures.push(fileName);
+      fs.writeFileSync(licencesPath, JSON.stringify(licences, null, 2));
+      console.log(`✅ Facture enregistrée dans licences.json pour ${opticien.email}`);
+    } else {
+      console.warn(`⚠️ Opticien ID ${opticien.id} introuvable dans licences.json`);
+    }
+
+    res.json({ url: `/factures/${fileName}` });
+  } catch (err) {
+    console.error('❌ Erreur mise à jour licences.json :', err);
+    res.status(500).json({ error: 'PDF généré mais erreur mise à jour licences.json' });
+  }
+});
+
+
+  stream.on('error', (err) => {
+    console.error('❌ Erreur PDF :', err);
+    res.status(500).json({ error: 'Erreur création PDF' });
+  });
+});
 
 // === Lancement serveur ===
 app.listen(PORT, () => {
   console.log(`✅ Serveur prêt sur http://localhost:${PORT}`);
 });
+
