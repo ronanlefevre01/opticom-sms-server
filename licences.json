@@ -4,6 +4,7 @@
     "email": "admin@opticom.app",
     "nom": "MON OPTIC TEST",
     "formule": "Illimitée",
+    "illimite": true,
     "date_debut": "2024-01-01",
     "date_fin": "2099-12-31",
     "credits": 999999,
