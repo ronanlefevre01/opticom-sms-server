@@ -10,10 +10,25 @@ const { URLSearchParams } = require('url');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const PDFDocument = require('pdfkit');
 const { v4: uuidv4 } = require('uuid');
+const nodemailer = require('nodemailer');
+const axios = require("axios");
+
+
 
 const app = express();
+const transporter = nodemailer.createTransport({
+  host: process.env.SMTP_HOST,
+  port: parseInt(process.env.SMTP_PORT),
+  auth: {
+    user: process.env.SMTP_USER,
+    pass: process.env.SMTP_PASS,
+  },
+});
+
 const PORT = process.env.PORT || 3001;
 const GO_CARDLESS_API_BASE = 'https://api-sandbox.gocardless.com';
+
+
 
 // Créer le dossier public/factures s'il n'existe pas
 const factureDir = path.join(__dirname, 'public/factures');
@@ -146,14 +161,28 @@ app.post('/confirm-mandat', async (req, res) => {
   }
 });
 
-// === Envoi de SMS via SMSMode ===
-app.post('/send-sms', async (req, res) => {
-  const { phoneNumber, message, emetteur } = req.body;
+const fs = require('fs');
+const licences = JSON.parse(fs.readFileSync('./licences.json'));
 
-  if (!phoneNumber || !message) {
-    return res.status(400).json({ success: false, error: 'Numéro ou message manquant.' });
+app.post('/send-sms', async (req, res) => {
+  const { phoneNumber, message, emetteur, licenceKey } = req.body;
+
+  if (!phoneNumber || !message || !licenceKey) {
+    return res.status(400).json({ success: false, error: 'Champs manquants.' });
   }
 
+  // Vérification de la licence
+  const licence = licences.find(l => l.cleLicence === licenceKey);
+  if (!licence) {
+    return res.status(403).json({ success: false, error: 'Licence invalide.' });
+  }
+
+  // Vérification des crédits
+  if (licence.formule !== 'Illimitée' && licence.credits < 1) {
+    return res.status(403).json({ success: false, error: 'Crédits insuffisants.' });
+  }
+
+  // Formatage du numéro
   const formattedNumber = phoneNumber.replace(/^0/, '+33');
   const params = new URLSearchParams();
   params.append('accessToken', process.env.SMSMODE_API_KEY);
@@ -176,6 +205,12 @@ app.post('/send-sms', async (req, res) => {
     console.log('📨 Réponse SMSMode :', text);
 
     if (response.ok && !text.includes('error')) {
+      // Décompte d'un crédit si formule non illimitée
+      if (licence.formule !== 'Illimitée') {
+        licence.credits -= 1;
+        fs.writeFileSync('./licences.json', JSON.stringify(licences, null, 2));
+      }
+
       return res.json({ success: true });
     } else {
       return res.status(500).json({ success: false, error: text });
@@ -185,6 +220,7 @@ app.post('/send-sms', async (req, res) => {
     res.status(500).json({ success: false, error: 'Erreur réseau.' });
   }
 });
+
 
 // === Achat de crédits via GoCardless (clients abonnés) ===
 app.post('/achat-credits-gocardless', async (req, res) => {
@@ -391,6 +427,28 @@ app.post('/api/generate-invoice', (req, res) => {
     } else {
       console.warn(`⚠️ Opticien ID ${opticien.id} introuvable dans licences.json`);
     }
+    // Envoi automatique de la facture par email
+const mailOptions = {
+  from: `"OptiCOM" <${process.env.SMTP_USER}>`,
+  to: opticien.email,
+  subject: `Votre facture OptiCOM - ${new Date().toLocaleDateString('fr-FR')}`,
+  text: `Bonjour ${opticien.prenom},\n\nVeuillez trouver ci-joint votre facture OptiCOM.\n\nType : ${type}\nMontant : ${montant.toFixed(2)} €\n\nCordialement,\nL’équipe OptiCOM`,
+  attachments: [
+    {
+      filename: fileName,
+      path: filePath,
+    },
+  ],
+};
+
+transporter.sendMail(mailOptions, (err, info) => {
+  if (err) {
+    console.error('❌ Erreur envoi email facture :', err);
+  } else {
+    console.log(`📧 Facture envoyée à ${opticien.email}`);
+  }
+});
+
 
     res.json({ url: `/factures/${fileName}` });
   } catch (err) {
@@ -404,6 +462,52 @@ app.post('/api/generate-invoice', (req, res) => {
     console.error('❌ Erreur PDF :', err);
     res.status(500).json({ error: 'Erreur création PDF' });
   });
+});
+
+// Envoi d’un SMS transactionnel (lunettes prêtes, SAV...)
+app.post('/send-transactional', async (req, res) => {
+  const { phoneNumber, message, senderLabel } = req.body;
+  try {
+    const response = await axios.post(
+      'https://api.smsmode.com/http/1.6/sendSMS.do',
+      null,
+      {
+        params: {
+          accessToken: process.env.SMSMODE_API_KEY,
+          message,
+          numero: phoneNumber,
+          emetteur: senderLabel,
+        },
+      }
+    );
+    res.json({ success: true, data: response.data });
+  } catch (error) {
+    console.error('Erreur SMS transactionnel :', error.message);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Envoi d’un SMS promotionnel (Noël, soldes...)
+app.post('/send-promotional', async (req, res) => {
+  const { phoneNumber, message, senderLabel } = req.body;
+  try {
+    const response = await axios.post(
+      'https://api.smsmode.com/http/1.6/sendMarketingSMS.do',
+      null,
+      {
+        params: {
+          accessToken: process.env.SMSMODE_API_KEY,
+          message,
+          numero: phoneNumber,
+          emetteur: senderLabel,
+        },
+      }
+    );
+    res.json({ success: true, data: response.data });
+  } catch (error) {
+    console.error('Erreur SMS promotionnel :', error.message);
+    res.status(500).json({ success: false, error: error.message });
+  }
 });
 
 // === Lancement serveur ===
