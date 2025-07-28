@@ -2,6 +2,7 @@
 require('dotenv').config();
 const express = require('express');
 const bodyParser = require('body-parser');
+const fs = require('fs');
 const cors = require('cors');
 const path = require('path');
 const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
@@ -160,7 +161,6 @@ app.post('/confirm-mandat', async (req, res) => {
   }
 });
 
-const fs = require('fs');
 const licences = JSON.parse(fs.readFileSync('./licences.json'));
 
 app.post('/send-sms', async (req, res) => {
