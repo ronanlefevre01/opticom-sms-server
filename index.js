@@ -124,9 +124,26 @@ app.post('/create-mandat', async (req, res) => {
     res.json({ url: data.redirect_flows.redirect_url });
 
   } catch (err) {
-    console.error('❗ Erreur GoCardless :', JSON.stringify(data, null, 2));
-    res.status(500).json({ error: 'Erreur GoCardless. Veuillez réessayer.' });
+    if (!response.ok) {
+  console.error('❗ Erreur GoCardless :');
+  console.error('Message :', data.error?.message);
+  console.error('Type :', data.error?.type);
+  console.error('Code :', data.error?.code);
+  console.error('Request ID :', data.error?.request_id);
+  console.error('Documentation :', data.error?.documentation_url);
+  
+  if (data.error?.errors && Array.isArray(data.error.errors)) {
+    console.error('Détails des erreurs :');
+    data.error.errors.forEach((err, index) => {
+      console.error(`  ${index + 1}. Champ : ${err.field}`);
+      console.error(`     Code : ${err.code}`);
+      console.error(`     Message : ${err.message}`);
+    });
   }
+
+  return res.status(500).json({ error: 'Erreur GoCardless. Vérifiez vos infos.' });
+}
+
 });
 
 
