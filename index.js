@@ -61,6 +61,28 @@ app.post('/create-mandat', async (req, res) => {
       metadata: { formule, siret, telephone }
     });
 
+    console.log('📦 Données envoyées à GoCardless :', JSON.stringify({
+  description: `Abonnement ${formule} - OptiCOM`,
+  session_token,
+  success_redirect_url: 'opticom://merci',
+  prefilled_customer: {
+    given_name: prenom?.trim(),
+    family_name: nom?.trim(),
+    email: email?.trim(),
+    address_line1: adresse?.trim(),
+    city: ville?.trim(),
+    postal_code: codePostal?.trim(),
+    country_code: pays && pays.length === 2 ? pays.toUpperCase() : 'FR',
+  },
+  metadata: {
+    formule,
+    siret,
+    telephone
+  }
+}, null, 2));
+
+
+
     const response = await fetch(`${GO_CARDLESS_API_BASE}/redirect_flows`, {
       method: 'POST',
       headers: {
