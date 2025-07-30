@@ -62,26 +62,24 @@ app.post('/create-mandat', async (req, res) => {
     });
 
     console.log('📦 Données envoyées à GoCardless :', JSON.stringify({
-  description: `Abonnement ${formule} - OptiCOM`,
-  session_token,
-  success_redirect_url: 'opticom://merci',
-  prefilled_customer: {
-    given_name: prenom?.trim(),
-    family_name: nom?.trim(),
-    email: email?.trim(),
-    address_line1: adresse?.trim(),
-    city: ville?.trim(),
-    postal_code: codePostal?.trim(),
-    country_code: pays && pays.length === 2 ? pays.toUpperCase() : 'FR',
-  },
-  metadata: {
-    formule,
-    siret,
-    telephone
-  }
-}, null, 2));
-
-
+      description: `Abonnement ${formule} - OptiCOM`,
+      session_token,
+      success_redirect_url: 'opticom://merci',
+      prefilled_customer: {
+        given_name: prenom?.trim(),
+        family_name: nom?.trim(),
+        email: email?.trim(),
+        address_line1: adresse?.trim(),
+        city: ville?.trim(),
+        postal_code: codePostal?.trim(),
+        country_code: pays && pays.length === 2 ? pays.toUpperCase() : 'FR',
+      },
+      metadata: {
+        formule,
+        siret,
+        telephone
+      }
+    }, null, 2));
 
     const response = await fetch(`${GO_CARDLESS_API_BASE}/redirect_flows`, {
       method: 'POST',
@@ -117,34 +115,33 @@ app.post('/create-mandat', async (req, res) => {
     console.log('📥 Réponse GoCardless :', data);
 
     if (!response.ok) {
-      console.error('❗ Erreur GoCardless :', data);
+      console.error('❗ Erreur GoCardless :');
+      console.error('Message :', data.error?.message);
+      console.error('Type :', data.error?.type);
+      console.error('Code :', data.error?.code);
+      console.error('Request ID :', data.error?.request_id);
+      console.error('Documentation :', data.error?.documentation_url);
+
+      if (data.error?.errors && Array.isArray(data.error.errors)) {
+        console.error('Détails des erreurs :');
+        data.error.errors.forEach((err, index) => {
+          console.error(`  ${index + 1}. Champ : ${err.field}`);
+          console.error(`     Code : ${err.code}`);
+          console.error(`     Message : ${err.message}`);
+        });
+      }
+
       return res.status(500).json({ error: 'Erreur GoCardless. Vérifiez vos infos.' });
     }
 
     res.json({ url: data.redirect_flows.redirect_url });
 
   } catch (err) {
-    if (!response.ok) {
-  console.error('❗ Erreur GoCardless :');
-  console.error('Message :', data.error?.message);
-  console.error('Type :', data.error?.type);
-  console.error('Code :', data.error?.code);
-  console.error('Request ID :', data.error?.request_id);
-  console.error('Documentation :', data.error?.documentation_url);
-  
-  if (data.error?.errors && Array.isArray(data.error.errors)) {
-    console.error('Détails des erreurs :');
-    data.error.errors.forEach((err, index) => {
-      console.error(`  ${index + 1}. Champ : ${err.field}`);
-      console.error(`     Code : ${err.code}`);
-      console.error(`     Message : ${err.message}`);
-    });
+    console.error('❗ Erreur GoCardless - Exception :', err);
+    return res.status(500).json({ error: 'Erreur serveur GoCardless. Veuillez réessayer.' });
   }
-
-  return res.status(500).json({ error: 'Erreur GoCardless. Vérifiez vos infos.' });
-}
-
 });
+
 
 
 // === Confirmer un mandat GoCardless ===
