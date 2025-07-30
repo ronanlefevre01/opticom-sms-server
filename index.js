@@ -102,7 +102,7 @@ app.post('/create-mandat', async (req, res) => {
     res.json({ url: data.redirect_flows.redirect_url });
 
   } catch (err) {
-    console.error('❗Erreur GoCardless:', err);
+    console.error('❗ Erreur GoCardless :', JSON.stringify(data, null, 2));
     res.status(500).json({ error: 'Erreur GoCardless. Veuillez réessayer.' });
   }
 });
