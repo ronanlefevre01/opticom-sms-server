@@ -11,8 +11,6 @@ const PDFDocument = require('pdfkit');
 const { v4: uuidv4 } = require('uuid');
 const nodemailer = require('nodemailer');
 const axios = require("axios");
-const confirmerMandatEtCreerLicence = require('./confirm-mandat');
-
 const app = express();
 const PORT = process.env.PORT || 3001;
 const GO_CARDLESS_API_BASE = 'https://api-sandbox.gocardless.com';
