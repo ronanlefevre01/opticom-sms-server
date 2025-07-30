@@ -11,6 +11,7 @@ const PDFDocument = require('pdfkit');
 const { v4: uuidv4 } = require('uuid');
 const nodemailer = require('nodemailer');
 const axios = require("axios");
+const confirmerMandatEtCreerLicence = require('./confirm-mandat');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -64,7 +65,7 @@ app.post('/create-mandat', async (req, res) => {
     console.log('📦 Données envoyées à GoCardless :', JSON.stringify({
       description: `Abonnement ${formule} - OptiCOM`,
       session_token,
-      success_redirect_url: "https://opti-admin.vercel.app/validation-mandat",
+      success_redirect_url: "https://opticom-sms-server.onrender.com/validation-mandat",
       prefilled_customer: {
         given_name: prenom?.trim(),
         family_name: nom?.trim(),
@@ -92,7 +93,7 @@ app.post('/create-mandat', async (req, res) => {
         redirect_flows: {
           description: `Abonnement ${formule} - OptiCOM`,
           session_token,
-          success_redirect_url: "https://opti-admin.vercel.app/validation-mandat",
+          success_redirect_url: "https://opticom-sms-server.onrender.com/validation-mandat",
           prefilled_customer: {
             given_name: prenom,
             family_name: nom,
@@ -225,6 +226,85 @@ app.post('/confirm-mandat', async (req, res) => {
 });
 
 const licences = JSON.parse(fs.readFileSync('./licences.json'));
+
+// 🟢 Route GET déclenchée automatiquement par GoCardless après signature
+app.get('/validation-mandat', async (req, res) => {
+  const redirectFlowId = req.query.redirect_flow_id;
+  if (!redirectFlowId) {
+    return res.status(400).send('redirect_flow_id manquant');
+  }
+
+  try {
+    const response = await fetch(`${process.env.GO_CARDLESS_API_BASE}/redirect_flows/${redirectFlowId}/actions/complete`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.GOCARDLESS_API_KEY}`,
+        'GoCardless-Version': '2015-07-06',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ data: { session_token: redirectFlowId } })
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      console.error('❗Erreur GoCardless (confirmation) :', data);
+      return res.status(500).send('Échec confirmation mandat');
+    }
+
+    const customer = data.redirect_flow.links.customer;
+    const mandate = data.redirect_flow.links.mandate;
+    const info = data.redirect_flow;
+
+    const licence = {
+      id: uuidv4(),
+      opticien: {
+        id: 'opt-' + Math.random().toString(36).substring(2, 10),
+        nom: info.prefilled_customer.given_name,
+        prenom: info.prefilled_customer.family_name,
+        email: info.prefilled_customer.email,
+        telephone: info.metadata.telephone,
+        formule: info.metadata.formule,
+        siret: info.metadata.siret,
+      },
+      customer,
+      mandate,
+      credits: 0,
+      createdAt: new Date().toISOString(),
+    };
+
+    const path = './licences.json';
+    let licences = [];
+
+    if (fs.existsSync(path)) {
+      licences = JSON.parse(fs.readFileSync(path, 'utf-8'));
+    }
+
+    licences.push(licence);
+    fs.writeFileSync(path, JSON.stringify(licences, null, 2));
+
+    // Envoi vers OptiAdmin
+    try {
+      await fetch('https://opti-admin.vercel.app/api/save-licence', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(licence),
+      });
+      console.log('📤 Licence synchronisée avec OptiAdmin (Vercel)');
+    } catch (error) {
+      console.error('❌ Erreur envoi licence vers OptiAdmin :', error);
+    }
+
+    console.log('✅ Licence enregistrée via GET :', licence.email);
+
+    // ✅ Redirige proprement vers la page merci de ton app
+    res.redirect('https://opticom.vercel.app/merci');
+  } catch (err) {
+    console.error('❗Erreur serveur /validation-mandat :', err);
+    res.status(500).send('Erreur réseau ou serveur');
+  }
+});
+
 
 app.post('/send-sms', async (req, res) => {
   const { phoneNumber, message, emetteur, licenceKey } = req.body;
