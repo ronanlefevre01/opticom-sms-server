@@ -64,7 +64,7 @@ app.post('/create-mandat', async (req, res) => {
     console.log('📦 Données envoyées à GoCardless :', JSON.stringify({
       description: `Abonnement ${formule} - OptiCOM`,
       session_token,
-      success_redirect_url: 'https://opticom.vercel.app/merci',
+      success_redirect_url: "https://opti-admin.vercel.app/validation-mandat",
       prefilled_customer: {
         given_name: prenom?.trim(),
         family_name: nom?.trim(),
@@ -92,7 +92,7 @@ app.post('/create-mandat', async (req, res) => {
         redirect_flows: {
           description: `Abonnement ${formule} - OptiCOM`,
           session_token,
-          success_redirect_url: 'https://opticom.vercel.app/merci',
+          success_redirect_url: "https://opti-admin.vercel.app/validation-mandat",
           prefilled_customer: {
             given_name: prenom,
             family_name: nom,
