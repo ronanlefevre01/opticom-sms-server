@@ -49,6 +49,18 @@ app.post('/create-mandat', async (req, res) => {
   try {
     const session_token = email + Date.now();
 
+    // 🟨 LOG : afficher les infos envoyées à GoCardless
+    console.log('📤 Données envoyées à GoCardless :', {
+      given_name: prenom,
+      family_name: nom,
+      email,
+      address_line1: adresse,
+      city: ville,
+      postal_code: codePostal,
+      country_code: pays && pays.length === 2 ? pays.toUpperCase() : 'FR',
+      metadata: { formule, siret, telephone }
+    });
+
     const response = await fetch(`${GO_CARDLESS_API_BASE}/redirect_flows`, {
       method: 'POST',
       headers: {
@@ -78,6 +90,9 @@ app.post('/create-mandat', async (req, res) => {
     });
 
     const data = await response.json();
+
+    // 🟨 LOG : afficher la réponse complète de GoCardless
+    console.log('📥 Réponse GoCardless :', data);
 
     if (!response.ok) {
       console.error('❗ Erreur GoCardless :', data);
