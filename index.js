@@ -214,7 +214,8 @@ app.post('/confirm-mandat', async (req, res) => {
 }
 
 
-    console.log('✅ Licence enregistrée:', licence.email);
+    console.log('✅ Licence enregistrée:', licence.opticien.email);
+
     res.json({ success: true, licence });
 
   } catch (err) {
