@@ -152,7 +152,7 @@ app.post('/create-mandat', async (req, res) => {
       redirect_flows: {
         description: `Abonnement ${formule} - OptiCOM`,
         session_token,
-        success_redirect_url: `https://opticom-sms-server.onrender.com/validation-mandat?session_token=${session_token}`,
+        success_redirect_url: `https://opticom-sms-server.onrender.com/validation-mandat`,
         prefilled_customer: customerData,
         metadata: {
           formule,
@@ -181,6 +181,9 @@ app.post('/create-mandat', async (req, res) => {
       console.error('❌ Erreur GoCardless :', data);
       return res.status(500).json({ error: 'Erreur GoCardless. Vérifiez vos informations.' });
     }
+
+    const redirectFlowId = data.redirect_flows.id;
+    redirectSessionMap[redirectFlowId] = session_token;
 
     console.log('✅ Redirection GoCardless générée :', data.redirect_flows.redirect_url);
     res.json({ url: data.redirect_flows.redirect_url });
@@ -229,6 +232,7 @@ app.post('/confirm-mandat', async (req, res) => {
     res.status(500).json({ error: 'Erreur serveur' });
   }
 });
+
 
 
 app.get('/validation-mandat', async (req, res) => {
