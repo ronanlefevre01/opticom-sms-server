@@ -235,12 +235,12 @@ app.post('/confirm-mandat', async (req, res) => {
 
 
 app.get('/validation-mandat', async (req, res) => {
-  const { redirect_flow_id } = req.query;
-
   try {
-    const session_token = redirectSessionMap[redirect_flow_id];
+    const redirectFlowId = req.query.redirect_flow_id;
+    const sessionToken = redirectSessionMap[redirectFlowId];
 
-    const response = await fetch(`https://api-sandbox.gocardless.com/redirect_flows/${redirect_flow_id}/actions/complete`, {
+    // Étape 1 : confirmer le redirect flow
+    const response = await fetch('https://api-sandbox.gocardless.com/redirect_flows/' + redirectFlowId + '/actions/complete', {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${process.env.GOCARDLESS_API_KEY}`,
@@ -249,29 +249,58 @@ app.get('/validation-mandat', async (req, res) => {
       },
       body: JSON.stringify({
         data: {
-          session_token
+          session_token: sessionToken
         }
       })
     });
 
     const result = await response.json();
 
-    if (!response.ok) {
+    // Vérification d'erreur
+    if (!response.ok || result.error) {
       console.error("❌ Réponse invalide GoCardless :", result);
-      return res.status(400).send('Erreur de confirmation GoCardless');
+      return res.status(400).send('Erreur GoCardless : ' + (result.error?.message || 'Erreur inconnue'));
     }
 
     const info = result.redirect_flows;
-    const customer = info.links.customer;
-    const mandate = info.links.mandate;
 
+    // Étape 2 : récupérer les infos complètes du client
+    const customerId = info.links.customer;
+    const customerResponse = await fetch(`https://api-sandbox.gocardless.com/customers/${customerId}`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${process.env.GOCARDLESS_API_KEY}`,
+        'GoCardless-Version': '2015-07-06',
+        'Content-Type': 'application/json'
+      }
+    });
+
+    const customerData = await customerResponse.json();
+    const customer = customerData.customers;
+
+    // Étape 3 : récupérer les infos du mandat (optionnel mais utile)
+    const mandateId = info.links.mandate;
+    const mandateResponse = await fetch(`https://api-sandbox.gocardless.com/mandates/${mandateId}`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${process.env.GOCARDLESS_API_KEY}`,
+        'GoCardless-Version': '2015-07-06',
+        'Content-Type': 'application/json'
+      }
+    });
+
+    const mandateData = await mandateResponse.json();
+    const mandate = mandateData.mandates;
+
+    // Étape 4 : enregistrement licence + sync
     await enregistrerLicenceEtSync(info, customer, mandate);
-    delete redirectSessionMap[redirect_flow_id];
+
+    delete redirectSessionMap[redirectFlowId];
 
     res.redirect('https://opticom.vercel.app/merci');
 
   } catch (err) {
-    console.error('❗ Erreur GET /validation-mandat :', err);
+    console.error('❗Erreur GET /validation-mandat :', err);
     res.status(500).send('Erreur serveur confirmation mandat.');
   }
 });
