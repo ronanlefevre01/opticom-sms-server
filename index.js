@@ -40,12 +40,13 @@ app.get('/', (req, res) => {
   res.send('✅ Serveur OptiCOM en ligne');
 });
 
-const GoCardless = require('gocardless-nodejs');
 const cookieParser = require('cookie-parser');
 app.use(cookieParser());
 
-const { Environment } = GoCardless;
-const gocardlessClient = GoCardless(process.env.GOCARDLESS_API_KEY, Environment.Sandbox);
+const gocardless = require('gocardless-nodejs');
+const gocardlessClient = gocardless(process.env.GOCARDLESS_API_KEY, 'sandbox');
+
+
 
 
 app.get('/create-redirect-flow', async (req, res) => {
