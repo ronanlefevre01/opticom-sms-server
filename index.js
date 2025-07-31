@@ -252,11 +252,6 @@ app.get('/validation-mandat', async (req, res) => {
     return res.status(400).send('redirect_flow_id manquant');
   }
 
-  const session_token = redirectSessionMap[redirectFlowId];
-  if (!session_token) {
-    return res.status(400).send('Session token introuvable pour ce redirect flow');
-  }
-
   try {
     const response = await fetch(`${GO_CARDLESS_API_BASE}/redirect_flows/${redirectFlowId}/actions/complete`, {
       method: 'POST',
@@ -265,14 +260,14 @@ app.get('/validation-mandat', async (req, res) => {
         'GoCardless-Version': '2015-07-06',
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ data: { session_token } })
+      body: JSON.stringify({ data: { session_token: redirectFlowId } })
     });
 
     const data = await response.json();
 
-    if (!response.ok) {
-      console.error('❗Erreur GoCardless (GET confirm) :', data);
-      return res.status(500).send('Échec confirmation mandat');
+    if (!response.ok || !data.redirect_flow || !data.redirect_flow.links) {
+      console.error('❌ Réponse invalide de GoCardless :', data);
+      return res.status(500).send('Échec confirmation mandat (réponse invalide)');
     }
 
     const customer = data.redirect_flow.links.customer;
@@ -287,6 +282,7 @@ app.get('/validation-mandat', async (req, res) => {
     res.status(500).send('Erreur serveur');
   }
 });
+
 
 
 app.post('/send-sms', async (req, res) => {
