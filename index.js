@@ -15,6 +15,8 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 const GO_CARDLESS_API_BASE = 'https://api-sandbox.gocardless.com';
 
+
+
 const transporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST,
   port: parseInt(process.env.SMTP_PORT),
@@ -37,6 +39,35 @@ app.use('/webhook-stripe', express.raw({ type: 'application/json' }));
 app.get('/', (req, res) => {
   res.send('✅ Serveur OptiCOM en ligne');
 });
+
+const { v4: uuidv4 } = require('uuid');
+const GoCardless = require('gocardless-nodejs');
+const cookieParser = require('cookie-parser');
+app.use(cookieParser());
+
+const gocardlessClient = GoCardless(process.env.GOCARDLESS_API_KEY, GoCardless.Environments.Sandbox); // ou .Sandbox
+
+app.get('/create-redirect-flow', async (req, res) => {
+  const sessionToken = uuidv4();
+
+  try {
+    const redirectFlow = await gocardlessClient.redirectFlows.create({
+      description: 'Mandat OptiCOM',
+      session_token: sessionToken,
+      success_redirect_url: 'https://opticom.vercel.app/confirm-mandat' // ou ton URL finale
+    });
+
+    // Stocke le session_token dans un cookie temporaire
+    res.cookie('session_token', sessionToken, { maxAge: 10 * 60 * 1000 }); // 10 min
+
+    // Redirige vers GoCardless
+    res.redirect(redirectFlow.redirect_url);
+  } catch (error) {
+    console.error('Erreur redirectFlow:', error);
+    res.status(500).send('Erreur création du redirect flow');
+  }
+});
+
 
 // === Créer un mandat GoCardless ===
 app.post('/create-mandat', async (req, res) => {
