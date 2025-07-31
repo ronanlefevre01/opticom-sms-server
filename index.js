@@ -129,8 +129,6 @@ app.get('/create-redirect-flow', async (req, res) => {
 });
 
 // === 🔐 Créer un mandat GoCardless ===
-const crypto = require('crypto');
-const redirectSessionMap = {};
 
 app.post('/create-mandat', async (req, res) => {
   const {
