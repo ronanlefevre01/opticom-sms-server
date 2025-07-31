@@ -254,7 +254,11 @@ app.get('/validation-mandat', async (req, res) => {
         'GoCardless-Version': '2015-07-06',
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ session_token })
+      body: JSON.stringify({
+    data: {
+      session_token: redirectSessionMap[redirectFlowId] || redirectFlowId
+    }
+  })
     });
 
     const data = await response.json();
