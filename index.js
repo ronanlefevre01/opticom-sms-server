@@ -235,52 +235,47 @@ app.post('/confirm-mandat', async (req, res) => {
 
 
 app.get('/validation-mandat', async (req, res) => {
-  const redirectFlowId = req.query.redirect_flow_id;
-
-  if (!redirectFlowId) {
-    return res.status(400).send('❌ Paramètre "redirect_flow_id" manquant.');
-  }
-
-  const session_token = redirectSessionMap[redirectFlowId];
-  if (!session_token) {
-    return res.status(400).send('❌ Session token introuvable. Veuillez recommencer.');
-  }
+  const { redirect_flow_id } = req.query;
 
   try {
-    const response = await fetch(`${GO_CARDLESS_API_BASE}/redirect_flows/${redirectFlowId}/actions/complete`, {
+    const session_token = redirectSessionMap[redirect_flow_id];
+
+    const response = await fetch(`https://api-sandbox.gocardless.com/redirect_flows/${redirect_flow_id}/actions/complete`, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${process.env.GOCARDLESS_API_KEY}`,
         'GoCardless-Version': '2015-07-06',
-        'Content-Type': 'application/json',
+        'Content-Type': 'application/json'
       },
       body: JSON.stringify({
-    data: {
-      session_token: redirectSessionMap[redirectFlowId] || redirectFlowId
-    }
-  })
+        data: {
+          session_token
+        }
+      })
     });
 
-    const data = await response.json();
+    const result = await response.json();
 
-    if (!response.ok || !data.redirect_flow?.links) {
-      console.error('❌ Réponse invalide GoCardless :', data);
-      return res.status(500).send('Erreur GoCardless : confirmation échouée.');
+    if (!response.ok) {
+      console.error("❌ Réponse invalide GoCardless :", result);
+      return res.status(400).send('Erreur de confirmation GoCardless');
     }
 
-    const customer = data.redirect_flow.links.customer;
-    const mandate = data.redirect_flow.links.mandate;
-    const info = data.redirect_flow;
+    const info = result.redirect_flows;
+    const customer = info.links.customer;
+    const mandate = info.links.mandate;
 
     await enregistrerLicenceEtSync(info, customer, mandate);
-    delete redirectSessionMap[redirectFlowId];
+    delete redirectSessionMap[redirect_flow_id];
 
     res.redirect('https://opticom.vercel.app/merci');
+
   } catch (err) {
-    console.error('❗Erreur GET /validation-mandat :', err);
+    console.error('❗ Erreur GET /validation-mandat :', err);
     res.status(500).send('Erreur serveur confirmation mandat.');
   }
 });
+
 
 
 app.post('/send-sms', async (req, res) => {
