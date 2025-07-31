@@ -8,6 +8,8 @@ const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 const axios = require('axios');
 const PDFDocument = require('pdfkit');
+const redirectSessionMap = {}; // { redirectFlowId: session_token }
+
 
 // Chargement conditionnel de node-fetch (compatible avec ES6)
 const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
@@ -191,6 +193,8 @@ app.post('/create-mandat', async (req, res) => {
     console.log('✅ Redirection GoCardless générée :', data.redirect_flows.redirect_url);
 
     res.json({ url: data.redirect_flows.redirect_url });
+    redirectSessionMap[data.redirect_flows.id] = session_token;
+
 
   } catch (err) {
     console.error('❗ Exception lors de la création du mandat :', err);
@@ -205,6 +209,11 @@ app.post('/confirm-mandat', async (req, res) => {
     return res.status(400).json({ error: 'Paramètre manquant: redirect_flow_id' });
   }
 
+  const session_token = redirectSessionMap[redirect_flow_id];
+  if (!session_token) {
+    return res.status(400).send('Session token introuvable pour ce redirect flow');
+  }
+
   try {
     const response = await fetch(`${GO_CARDLESS_API_BASE}/redirect_flows/${redirect_flow_id}/actions/complete`, {
       method: 'POST',
@@ -213,7 +222,7 @@ app.post('/confirm-mandat', async (req, res) => {
         'GoCardless-Version': '2015-07-06',
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ data: { session_token: redirect_flow_id } })
+      body: JSON.stringify({ data: { session_token } })
     });
 
     const data = await response.json();
@@ -236,10 +245,16 @@ app.post('/confirm-mandat', async (req, res) => {
   }
 });
 
+
 app.get('/validation-mandat', async (req, res) => {
   const redirectFlowId = req.query.redirect_flow_id;
   if (!redirectFlowId) {
     return res.status(400).send('redirect_flow_id manquant');
+  }
+
+  const session_token = redirectSessionMap[redirectFlowId];
+  if (!session_token) {
+    return res.status(400).send('Session token introuvable pour ce redirect flow');
   }
 
   try {
@@ -250,7 +265,7 @@ app.get('/validation-mandat', async (req, res) => {
         'GoCardless-Version': '2015-07-06',
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ data: { session_token: redirectFlowId } })
+      body: JSON.stringify({ data: { session_token } })
     });
 
     const data = await response.json();
@@ -272,6 +287,7 @@ app.get('/validation-mandat', async (req, res) => {
     res.status(500).send('Erreur serveur');
   }
 });
+
 
 app.post('/send-sms', async (req, res) => {
   const { phoneNumber, message, emetteur, licenceKey } = req.body;
