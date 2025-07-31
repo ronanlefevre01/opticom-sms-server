@@ -276,7 +276,14 @@ app.get('/validation-mandat', async (req, res) => {
     });
 
     const customerData = await customerResponse.json();
+    console.log("Réponse GoCardless /customers :", customerData);
     const customer = customerData.customers;
+
+    if (!customer) {
+  console.error('❌ Client GoCardless introuvable', customerData);
+  return res.status(500).send('Erreur : client GoCardless introuvable.');
+}
+
 
     // Étape 3 : récupérer les infos du mandat (optionnel mais utile)
     const mandateId = info.links.mandate;
