@@ -277,7 +277,7 @@ app.get('/validation-mandat', async (req, res) => {
 
     const customerData = await customerResponse.json();
     console.log("Réponse GoCardless /customers :", customerData);
-    const customer = customerData.customers;
+    const customer = customerData;
 
     if (!customer) {
   console.error('❌ Client GoCardless introuvable', customerData);
