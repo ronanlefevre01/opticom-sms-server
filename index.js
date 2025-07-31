@@ -44,7 +44,9 @@ const GoCardless = require('gocardless-nodejs');
 const cookieParser = require('cookie-parser');
 app.use(cookieParser());
 
-const gocardlessClient = GoCardless(process.env.GOCARDLESS_API_KEY, GoCardless.Environments.Sandbox); // ou .Sandbox
+const { Environment } = GoCardless;
+const gocardlessClient = GoCardless(process.env.GOCARDLESS_API_KEY, Environment.Sandbox);
+
 
 app.get('/create-redirect-flow', async (req, res) => {
   const sessionToken = uuidv4();
