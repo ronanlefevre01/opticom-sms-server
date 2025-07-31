@@ -129,6 +129,9 @@ app.get('/create-redirect-flow', async (req, res) => {
 });
 
 // === 🔐 Créer un mandat GoCardless ===
+const crypto = require('crypto');
+const redirectSessionMap = {};
+
 app.post('/create-mandat', async (req, res) => {
   const {
     nom, prenom, email, adresse, ville,
@@ -136,7 +139,7 @@ app.post('/create-mandat', async (req, res) => {
   } = req.body;
 
   try {
-    const session_token = `${email}-${Date.now()}`;
+    const session_token = crypto.randomUUID();
 
     const customerData = {
       given_name: prenom?.trim(),
@@ -152,18 +155,11 @@ app.post('/create-mandat', async (req, res) => {
       redirect_flows: {
         description: `Abonnement ${formule} - OptiCOM`,
         session_token,
-        success_redirect_url: `https://opticom-sms-server.onrender.com/validation-mandat`,
+        success_redirect_url: "https://opticom-sms-server.onrender.com/validation-mandat",
         prefilled_customer: customerData,
-        metadata: {
-          formule,
-          siret,
-          telephone,
-          session_token
-        }
+        metadata: { formule, siret, telephone }
       }
     };
-
-    console.log('📤 Données envoyées à GoCardless :', JSON.stringify(redirectFlowData, null, 2));
 
     const response = await fetch(`${GO_CARDLESS_API_BASE}/redirect_flows`, {
       method: 'POST',
@@ -177,29 +173,33 @@ app.post('/create-mandat', async (req, res) => {
 
     const data = await response.json();
 
-    if (!response.ok) {
-      console.error('❌ Erreur GoCardless :', data);
+    if (!response.ok || !data.redirect_flows?.redirect_url) {
+      console.error('❌ Erreur GoCardless :', data.error);
       return res.status(500).json({ error: 'Erreur GoCardless. Vérifiez vos informations.' });
     }
 
     const redirectFlowId = data.redirect_flows.id;
     redirectSessionMap[redirectFlowId] = session_token;
 
-    console.log('✅ Redirection GoCardless générée :', data.redirect_flows.redirect_url);
-    res.json({ url: data.redirect_flows.redirect_url });
+    res.status(200).json({ url: data.redirect_flows.redirect_url });
 
   } catch (err) {
-    console.error('❗ Exception lors de la création du mandat :', err);
+    console.error('❗ Exception GoCardless:', err);
     return res.status(500).json({ error: 'Erreur serveur GoCardless. Veuillez réessayer.' });
   }
 });
 
 
 app.post('/confirm-mandat', async (req, res) => {
-  const { redirect_flow_id, session_token } = req.body;
+  const { redirect_flow_id } = req.body;
 
-  if (!redirect_flow_id || !session_token) {
-    return res.status(400).json({ error: 'Paramètres manquants: redirect_flow_id ou session_token' });
+  if (!redirect_flow_id) {
+    return res.status(400).json({ error: 'Paramètre manquant: redirect_flow_id' });
+  }
+
+  const session_token = redirectSessionMap[redirect_flow_id];
+  if (!session_token) {
+    return res.status(400).send('Session token introuvable pour ce redirect flow.');
   }
 
   try {
@@ -210,14 +210,14 @@ app.post('/confirm-mandat', async (req, res) => {
         'GoCardless-Version': '2015-07-06',
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify( { session_token } )
+      body: JSON.stringify({ session_token })
     });
 
     const data = await response.json();
 
     if (!response.ok || !data.redirect_flow?.links) {
-      console.error('❗Erreur GoCardless (POST confirm) :', data);
-      return res.status(500).json({ error: 'Échec confirmation mandat' });
+      console.error('❗Erreur GoCardless (confirmation) :', data);
+      return res.status(500).json({ error: 'Échec confirmation mandat GoCardless.' });
     }
 
     const customer = data.redirect_flow.links.customer;
@@ -225,6 +225,8 @@ app.post('/confirm-mandat', async (req, res) => {
     const info = data.redirect_flow;
 
     const licence = await enregistrerLicenceEtSync(info, customer, mandate);
+
+    delete redirectSessionMap[redirect_flow_id];
 
     res.json({ success: true, licence });
   } catch (err) {
@@ -234,16 +236,16 @@ app.post('/confirm-mandat', async (req, res) => {
 });
 
 
-
 app.get('/validation-mandat', async (req, res) => {
   const redirectFlowId = req.query.redirect_flow_id;
+
   if (!redirectFlowId) {
-    return res.status(400).send('redirect_flow_id manquant');
+    return res.status(400).send('❌ Paramètre "redirect_flow_id" manquant.');
   }
 
   const session_token = redirectSessionMap[redirectFlowId];
   if (!session_token) {
-    return res.status(400).send('Session token introuvable pour ce redirect flow');
+    return res.status(400).send('❌ Session token introuvable. Veuillez recommencer.');
   }
 
   try {
@@ -254,14 +256,14 @@ app.get('/validation-mandat', async (req, res) => {
         'GoCardless-Version': '2015-07-06',
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify( { session_token } )
+      body: JSON.stringify({ session_token })
     });
 
     const data = await response.json();
 
-    if (!response.ok || !data.redirect_flow || !data.redirect_flow.links) {
-      console.error('❌ Réponse invalide de GoCardless :', data);
-      return res.status(500).send('Échec confirmation mandat (réponse invalide)');
+    if (!response.ok || !data.redirect_flow?.links) {
+      console.error('❌ Réponse invalide GoCardless :', data);
+      return res.status(500).send('Erreur GoCardless : confirmation échouée.');
     }
 
     const customer = data.redirect_flow.links.customer;
@@ -269,11 +271,12 @@ app.get('/validation-mandat', async (req, res) => {
     const info = data.redirect_flow;
 
     await enregistrerLicenceEtSync(info, customer, mandate);
+    delete redirectSessionMap[redirectFlowId];
 
     res.redirect('https://opticom.vercel.app/merci');
   } catch (err) {
-    console.error('❗Erreur serveur GET /validation-mandat :', err);
-    res.status(500).send('Erreur serveur');
+    console.error('❗Erreur GET /validation-mandat :', err);
+    res.status(500).send('Erreur serveur confirmation mandat.');
   }
 });
 
