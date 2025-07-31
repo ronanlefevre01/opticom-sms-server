@@ -236,81 +236,54 @@ app.post('/confirm-mandat', async (req, res) => {
 
 app.get('/validation-mandat', async (req, res) => {
   try {
-    const redirectFlowId = req.query.redirect_flow_id;
-    const sessionToken = redirectSessionMap[redirectFlowId];
+    const { redirect_flow_id, session_token } = req.query;
 
-    // Étape 1 : confirmer le redirect flow
-    const response = await fetch('https://api-sandbox.gocardless.com/redirect_flows/' + redirectFlowId + '/actions/complete', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${process.env.GOCARDLESS_API_KEY}`,
-        'GoCardless-Version': '2015-07-06',
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        data: {
-          session_token: sessionToken
-        }
-      })
+    const completed = await goCardless.redirectFlows.complete(redirect_flow_id, {
+      params: { session_token }
     });
 
-    const result = await response.json();
-
-    // Vérification d'erreur
-    if (!response.ok || result.error) {
-      console.error("❌ Réponse invalide GoCardless :", result);
-      return res.status(400).send('Erreur GoCardless : ' + (result.error?.message || 'Erreur inconnue'));
-    }
-
-    const info = result.redirect_flows;
-
-    // Étape 2 : récupérer les infos complètes du client
-    const customerId = info.links.customer;
-    const customerResponse = await fetch(`https://api-sandbox.gocardless.com/customers/${customerId}`, {
-      method: 'GET',
-      headers: {
-        'Authorization': `Bearer ${process.env.GOCARDLESS_API_KEY}`,
-        'GoCardless-Version': '2015-07-06',
-        'Content-Type': 'application/json'
-      }
-    });
-
-    const customerData = await customerResponse.json();
-    console.log("Réponse GoCardless /customers :", customerData);
-    const customer = customerData;
+    const customerId = completed.links.customer;
+    const customerResponse = await goCardless.customers.find(customerId);
+    const customer = customerResponse.customer;
 
     if (!customer) {
-  console.error('❌ Client GoCardless introuvable', customerData);
-  return res.status(500).send('Erreur : client GoCardless introuvable.');
-}
+      return res.status(500).send('Erreur : client GoCardless introuvable.');
+    }
 
+    // Générer une clé unique
+    const licenceId = uuidv4();
 
-    // Étape 3 : récupérer les infos du mandat (optionnel mais utile)
-    const mandateId = info.links.mandate;
-    const mandateResponse = await fetch(`https://api-sandbox.gocardless.com/mandates/${mandateId}`, {
-      method: 'GET',
-      headers: {
-        'Authorization': `Bearer ${process.env.GOCARDLESS_API_KEY}`,
-        'GoCardless-Version': '2015-07-06',
-        'Content-Type': 'application/json'
-      }
-    });
+    // Charger le fichier existant
+    const licencesPath = path.join(__dirname, 'licences.json');
+    const licences = JSON.parse(fs.readFileSync(licencesPath, 'utf8'));
 
-    const mandateData = await mandateResponse.json();
-    const mandate = mandateData.mandates;
+    // Créer la licence
+    const newLicence = {
+      id: licenceId,
+      nom: customer.family_name,
+      prenom: customer.given_name,
+      email: customer.email,
+      credits: 500, // ou selon la formule
+      formule: 'Pro',
+      dateDebut: new Date().toISOString(),
+      dateFin: new Date(new Date().setMonth(new Date().getMonth() + 1)).toISOString()
+    };
 
-    // Étape 4 : enregistrement licence + sync
-    await enregistrerLicenceEtSync(info, customer, mandate);
+    // Ajouter à la liste
+    licences.push(newLicence);
 
-    delete redirectSessionMap[redirectFlowId];
+    // Sauvegarder
+    fs.writeFileSync(licencesPath, JSON.stringify(licences, null, 2), 'utf8');
 
-    res.redirect('https://opticom.vercel.app/merci');
+    // Retourner la licence au front
+    res.json(newLicence);
 
-  } catch (err) {
-    console.error('❗Erreur GET /validation-mandat :', err);
-    res.status(500).send('Erreur serveur confirmation mandat.');
+  } catch (error) {
+    console.error('Erreur GET /validation-mandat :', error);
+    res.status(500).send('Erreur lors de la validation du mandat.');
   }
 });
+
 
 
 
