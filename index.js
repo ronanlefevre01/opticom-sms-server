@@ -40,7 +40,6 @@ app.get('/', (req, res) => {
   res.send('✅ Serveur OptiCOM en ligne');
 });
 
-const { v4: uuidv4 } = require('uuid');
 const GoCardless = require('gocardless-nodejs');
 const cookieParser = require('cookie-parser');
 app.use(cookieParser());
