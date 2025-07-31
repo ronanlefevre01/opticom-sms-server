@@ -233,10 +233,13 @@ app.post('/confirm-mandat', async (req, res) => {
 
 app.get('/validation-mandat', async (req, res) => {
   const redirectFlowId = req.query.redirect_flow_id;
-  const session_token = req.query.session_token;
+  if (!redirectFlowId) {
+    return res.status(400).send('redirect_flow_id manquant');
+  }
 
-  if (!redirectFlowId || !session_token) {
-    return res.status(400).send('Paramètres manquants (redirect_flow_id ou session_token)');
+  const session_token = redirectSessionMap[redirectFlowId];
+  if (!session_token) {
+    return res.status(400).send('Session token introuvable pour ce redirect flow');
   }
 
   try {
@@ -252,7 +255,7 @@ app.get('/validation-mandat', async (req, res) => {
 
     const data = await response.json();
 
-    if (!response.ok || !data.redirect_flow?.links) {
+    if (!response.ok || !data.redirect_flow || !data.redirect_flow.links) {
       console.error('❌ Réponse invalide de GoCardless :', data);
       return res.status(500).send('Échec confirmation mandat (réponse invalide)');
     }
