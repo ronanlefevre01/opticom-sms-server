@@ -1,54 +1,109 @@
-require('dotenv').config();
+require('dotenv').config(); // Charge les variables d'environnement depuis .env
+
 const express = require('express');
 const bodyParser = require('body-parser');
 const fs = require('fs');
 const cors = require('cors');
 const path = require('path');
+const { v4: uuidv4 } = require('uuid');
+const axios = require('axios');
+const PDFDocument = require('pdfkit');
+
+// Chargement conditionnel de node-fetch (compatible avec ES6)
 const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
 const { URLSearchParams } = require('url');
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
-const PDFDocument = require('pdfkit');
-const { v4: uuidv4 } = require('uuid');
-const nodemailer = require('nodemailer');
-const axios = require("axios");
+
+// Initialisation de l'app Express
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+// Configuration de Stripe
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+
+// Configuration GoCardless Sandbox (ou live si tu changes l'URL)
 const GO_CARDLESS_API_BASE = 'https://api-sandbox.gocardless.com';
 
+// === Fonctions utilitaires pour charger / enregistrer les licences ===
+const pathLic = path.join(__dirname, 'licences.json');
+
+function chargerLicences() {
+  return fs.existsSync(pathLic) ? JSON.parse(fs.readFileSync(pathLic, 'utf-8')) : [];
+}
+
+function enregistrerLicences(licences) {
+  fs.writeFileSync(pathLic, JSON.stringify(licences, null, 2));
+}
 
 
-const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST,
-  port: parseInt(process.env.SMTP_PORT),
-  auth: {
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS,
-  },
-});
 
-// Créer le dossier public/factures s'il n'existe pas
+// 📁 Créer le dossier public/factures s'il n'existe pas
 const factureDir = path.join(__dirname, 'public/factures');
 if (!fs.existsSync(factureDir)) {
   fs.mkdirSync(factureDir, { recursive: true });
 }
 
+// 🧩 Middleware
 app.use(cors());
 app.use(bodyParser.json());
 app.use('/webhook-stripe', express.raw({ type: 'application/json' }));
 
+async function enregistrerLicenceEtSync(info, customer, mandate) {
+  const licence = {
+    id: uuidv4(),
+    opticien: {
+      id: 'opt-' + Math.random().toString(36).substring(2, 10),
+      nom: info.prefilled_customer.given_name,
+      prenom: info.prefilled_customer.family_name,
+      email: info.prefilled_customer.email,
+      telephone: info.metadata.telephone,
+      formule: info.metadata.formule,
+      siret: info.metadata.siret,
+    },
+    customer,
+    mandate,
+    credits: 0,
+    createdAt: new Date().toISOString(),
+  };
+
+  const path = './licences.json';
+  let licences = [];
+
+  if (fs.existsSync(path)) {
+    licences = JSON.parse(fs.readFileSync(path, 'utf-8'));
+  }
+
+  licences.push(licence);
+  fs.writeFileSync(path, JSON.stringify(licences, null, 2));
+
+  try {
+    await fetch('https://opti-admin.vercel.app/api/save-licence', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(licence),
+    });
+    console.log('📤 Licence synchronisée avec OptiAdmin');
+  } catch (err) {
+    console.error('❌ Erreur synchronisation licence :', err.message);
+  }
+
+  return licence;
+}
+
+
+// 🍪 Cookies
+const cookieParser = require('cookie-parser');
+app.use(cookieParser());
+
+// 🧪 Test serveur
 app.get('/', (req, res) => {
   res.send('✅ Serveur OptiCOM en ligne');
 });
 
-const cookieParser = require('cookie-parser');
-app.use(cookieParser());
-
+// 🔐 GoCardless (mode sandbox, à passer en 'live' pour production)
 const gocardless = require('gocardless-nodejs');
-const gocardlessClient = gocardless(process.env.GOCARDLESS_API_KEY, 'sandbox');
+const gocardlessClient = gocardless(process.env.GOCARDLESS_API_KEY, 'sandbox'); // ou 'live'
 
-
-
-
+// 🧭 Route de création du redirect flow GoCardless
 app.get('/create-redirect-flow', async (req, res) => {
   const sessionToken = uuidv4();
 
@@ -56,22 +111,21 @@ app.get('/create-redirect-flow', async (req, res) => {
     const redirectFlow = await gocardlessClient.redirectFlows.create({
       description: 'Mandat OptiCOM',
       session_token: sessionToken,
-      success_redirect_url: 'https://opticom.vercel.app/confirm-mandat' // ou ton URL finale
+      success_redirect_url: 'https://opticom.vercel.app/confirm-mandat', // Change si besoin
     });
 
-    // Stocke le session_token dans un cookie temporaire
-    res.cookie('session_token', sessionToken, { maxAge: 10 * 60 * 1000 }); // 10 min
+    // 🍪 Stocke le token dans un cookie temporaire (10 min)
+    res.cookie('session_token', sessionToken, { maxAge: 10 * 60 * 1000, httpOnly: true });
 
-    // Redirige vers GoCardless
+    // 🔁 Redirige le navigateur vers GoCardless pour signature du mandat
     res.redirect(redirectFlow.redirect_url);
   } catch (error) {
-    console.error('Erreur redirectFlow:', error);
+    console.error('❌ Erreur lors de la création du redirect flow GoCardless:', error.message);
     res.status(500).send('Erreur création du redirect flow');
   }
 });
 
-
-// === Créer un mandat GoCardless ===
+// === 🔐 Créer un mandat GoCardless ===
 app.post('/create-mandat', async (req, res) => {
   const {
     nom, prenom, email, adresse, ville,
@@ -79,40 +133,36 @@ app.post('/create-mandat', async (req, res) => {
   } = req.body;
 
   try {
-    const session_token = email + Date.now();
+    const session_token = email + '-' + Date.now();
 
-    // 🟨 LOG : afficher les infos envoyées à GoCardless
-    console.log('📤 Données envoyées à GoCardless :', {
-      given_name: prenom,
-      family_name: nom,
-      email,
-      address_line1: adresse,
-      city: ville,
-      postal_code: codePostal,
+    const customerData = {
+      given_name: prenom?.trim(),
+      family_name: nom?.trim(),
+      email: email?.trim(),
+      address_line1: adresse?.trim(),
+      city: ville?.trim(),
+      postal_code: codePostal?.trim(),
       country_code: pays && pays.length === 2 ? pays.toUpperCase() : 'FR',
-      metadata: { formule, siret, telephone }
-    });
+    };
 
-    console.log('📦 Données envoyées à GoCardless :', JSON.stringify({
-      description: `Abonnement ${formule} - OptiCOM`,
-      session_token,
-      success_redirect_url: "https://opticom-sms-server.onrender.com/validation-mandat",
-      prefilled_customer: {
-        given_name: prenom?.trim(),
-        family_name: nom?.trim(),
-        email: email?.trim(),
-        address_line1: adresse?.trim(),
-        city: ville?.trim(),
-        postal_code: codePostal?.trim(),
-        country_code: pays && pays.length === 2 ? pays.toUpperCase() : 'FR',
-      },
-      metadata: {
-        formule,
-        siret,
-        telephone
+    const redirectFlowData = {
+      redirect_flows: {
+        description: `Abonnement ${formule} - OptiCOM`,
+        session_token,
+        success_redirect_url: "https://opticom-sms-server.onrender.com/validation-mandat",
+        prefilled_customer: customerData,
+        metadata: {
+          formule,
+          siret,
+          telephone,
+        }
       }
-    }, null, 2));
+    };
 
+    // 📤 Log de ce qu'on envoie
+    console.log('📤 Données envoyées à GoCardless :', JSON.stringify(redirectFlowData, null, 2));
+
+    // ⬆️ Envoi vers GoCardless API
     const response = await fetch(`${GO_CARDLESS_API_BASE}/redirect_flows`, {
       method: 'POST',
       headers: {
@@ -120,63 +170,34 @@ app.post('/create-mandat', async (req, res) => {
         'Authorization': `Bearer ${process.env.GOCARDLESS_API_KEY}`,
         'GoCardless-Version': '2015-07-06'
       },
-      body: JSON.stringify({
-        redirect_flows: {
-          description: `Abonnement ${formule} - OptiCOM`,
-          session_token,
-          success_redirect_url: "https://opticom-sms-server.onrender.com/validation-mandat",
-          prefilled_customer: {
-            given_name: prenom,
-            family_name: nom,
-            email,
-            address_line1: adresse,
-            city: ville,
-            postal_code: codePostal,
-            country_code: pays && pays.length === 2 ? pays.toUpperCase() : 'FR',
-          },
-          metadata: {
-            formule, siret, telephone,
-          }
-        }
-      })
+      body: JSON.stringify(redirectFlowData)
     });
 
     const data = await response.json();
 
-    // 🟨 LOG : afficher la réponse complète de GoCardless
-    console.log('📥 Réponse GoCardless :', data);
-
     if (!response.ok) {
-      console.error('❗ Erreur GoCardless :');
-      console.error('Message :', data.error?.message);
-      console.error('Type :', data.error?.type);
-      console.error('Code :', data.error?.code);
-      console.error('Request ID :', data.error?.request_id);
-      console.error('Documentation :', data.error?.documentation_url);
+      console.error('❌ Erreur GoCardless :', {
+        message: data.error?.message,
+        type: data.error?.type,
+        code: data.error?.code,
+        request_id: data.error?.request_id,
+        documentation_url: data.error?.documentation_url,
+        errors: data.error?.errors,
+      });
 
-      if (data.error?.errors && Array.isArray(data.error.errors)) {
-        console.error('Détails des erreurs :');
-        data.error.errors.forEach((err, index) => {
-          console.error(`  ${index + 1}. Champ : ${err.field}`);
-          console.error(`     Code : ${err.code}`);
-          console.error(`     Message : ${err.message}`);
-        });
-      }
-
-      return res.status(500).json({ error: 'Erreur GoCardless. Vérifiez vos infos.' });
+      return res.status(500).json({ error: 'Erreur GoCardless. Vérifiez vos informations.' });
     }
+
+    console.log('✅ Redirection GoCardless générée :', data.redirect_flows.redirect_url);
 
     res.json({ url: data.redirect_flows.redirect_url });
 
   } catch (err) {
-    console.error('❗ Erreur GoCardless - Exception :', err);
+    console.error('❗ Exception lors de la création du mandat :', err);
     return res.status(500).json({ error: 'Erreur serveur GoCardless. Veuillez réessayer.' });
   }
 });
 
-
-
-// === Confirmer un mandat GoCardless ===
 app.post('/confirm-mandat', async (req, res) => {
   const { redirect_flow_id } = req.body;
 
@@ -198,7 +219,7 @@ app.post('/confirm-mandat', async (req, res) => {
     const data = await response.json();
 
     if (!response.ok) {
-      console.error('❗Erreur GoCardless (confirmation) :', data);
+      console.error('❗Erreur GoCardless (POST confirm) :', data);
       return res.status(500).json({ error: 'Échec confirmation mandat' });
     }
 
@@ -206,59 +227,15 @@ app.post('/confirm-mandat', async (req, res) => {
     const mandate = data.redirect_flow.links.mandate;
     const info = data.redirect_flow;
 
-    const licence = {
-  id: uuidv4(), // ID global unique
-  opticien: {
-    id: 'opt-' + Math.random().toString(36).substring(2, 10), // ID spécifique opticien
-    nom: info.prefilled_customer.given_name,
-    prenom: info.prefilled_customer.family_name,
-    email: info.prefilled_customer.email,
-    telephone: info.metadata.telephone,
-    formule: info.metadata.formule,
-    siret: info.metadata.siret,
-  },
-  customer,
-  mandate,
-  credits: 0,
-  createdAt: new Date().toISOString(),
-};
-
-
-    const path = './licences.json';
-    let licences = [];
-
-    if (fs.existsSync(path)) {
-      licences = JSON.parse(fs.readFileSync(path, 'utf-8'));
-    }
-
-    licences.push(licence);
-    fs.writeFileSync(path, JSON.stringify(licences, null, 2));
-
-    try {
-  await fetch('https://opti-admin.vercel.app/api/save-licence', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(licence),
-  });
-  console.log('📤 Licence synchronisée avec OptiAdmin (Vercel)');
-} catch (error) {
-  console.error('❌ Erreur envoi licence vers OptiAdmin :', error);
-}
-
-
-    console.log('✅ Licence enregistrée:', licence.opticien.email);
+    const licence = await enregistrerLicenceEtSync(info, customer, mandate);
 
     res.json({ success: true, licence });
-
   } catch (err) {
-    console.error('❗Erreur serveur /confirm-mandat :', err);
-    res.status(500).json({ error: 'Erreur réseau ou serveur' });
+    console.error('❗Erreur serveur POST /confirm-mandat :', err);
+    res.status(500).json({ error: 'Erreur serveur' });
   }
 });
 
-const licences = JSON.parse(fs.readFileSync('./licences.json'));
-
-// 🟢 Route GET déclenchée automatiquement par GoCardless après signature
 app.get('/validation-mandat', async (req, res) => {
   const redirectFlowId = req.query.redirect_flow_id;
   if (!redirectFlowId) {
@@ -266,7 +243,7 @@ app.get('/validation-mandat', async (req, res) => {
   }
 
   try {
-    const response = await fetch(`${process.env.GO_CARDLESS_API_BASE}/redirect_flows/${redirectFlowId}/actions/complete`, {
+    const response = await fetch(`${GO_CARDLESS_API_BASE}/redirect_flows/${redirectFlowId}/actions/complete`, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${process.env.GOCARDLESS_API_KEY}`,
@@ -279,7 +256,7 @@ app.get('/validation-mandat', async (req, res) => {
     const data = await response.json();
 
     if (!response.ok) {
-      console.error('❗Erreur GoCardless (confirmation) :', data);
+      console.error('❗Erreur GoCardless (GET confirm) :', data);
       return res.status(500).send('Échec confirmation mandat');
     }
 
@@ -287,55 +264,14 @@ app.get('/validation-mandat', async (req, res) => {
     const mandate = data.redirect_flow.links.mandate;
     const info = data.redirect_flow;
 
-    const licence = {
-      id: uuidv4(),
-      opticien: {
-        id: 'opt-' + Math.random().toString(36).substring(2, 10),
-        nom: info.prefilled_customer.given_name,
-        prenom: info.prefilled_customer.family_name,
-        email: info.prefilled_customer.email,
-        telephone: info.metadata.telephone,
-        formule: info.metadata.formule,
-        siret: info.metadata.siret,
-      },
-      customer,
-      mandate,
-      credits: 0,
-      createdAt: new Date().toISOString(),
-    };
+    await enregistrerLicenceEtSync(info, customer, mandate);
 
-    const path = './licences.json';
-    let licences = [];
-
-    if (fs.existsSync(path)) {
-      licences = JSON.parse(fs.readFileSync(path, 'utf-8'));
-    }
-
-    licences.push(licence);
-    fs.writeFileSync(path, JSON.stringify(licences, null, 2));
-
-    // Envoi vers OptiAdmin
-    try {
-      await fetch('https://opti-admin.vercel.app/api/save-licence', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(licence),
-      });
-      console.log('📤 Licence synchronisée avec OptiAdmin (Vercel)');
-    } catch (error) {
-      console.error('❌ Erreur envoi licence vers OptiAdmin :', error);
-    }
-
-    console.log('✅ Licence enregistrée via GET :', licence.email);
-
-    // ✅ Redirige proprement vers la page merci de ton app
     res.redirect('https://opticom.vercel.app/merci');
   } catch (err) {
-    console.error('❗Erreur serveur /validation-mandat :', err);
-    res.status(500).send('Erreur réseau ou serveur');
+    console.error('❗Erreur serveur GET /validation-mandat :', err);
+    res.status(500).send('Erreur serveur');
   }
 });
-
 
 app.post('/send-sms', async (req, res) => {
   const { phoneNumber, message, emetteur, licenceKey } = req.body;
@@ -392,23 +328,28 @@ app.post('/send-sms', async (req, res) => {
   }
 });
 
-
-
 // === Achat de crédits via GoCardless (clients abonnés) ===
 app.post('/achat-credits-gocardless', async (req, res) => {
   const { email, quantity } = req.body;
   const qty = Math.max(1, parseInt(quantity || '1'));
 
   try {
-    const licences = fs.existsSync('./licences.json') ? JSON.parse(fs.readFileSync('./licences.json', 'utf-8')) : [];
-    const index = licences.findIndex(l => l.opticien?.email === email);
+    const pathLicences = './licences.json';
+    const licences = fs.existsSync(pathLicences)
+      ? JSON.parse(fs.readFileSync(pathLicences, 'utf-8'))
+      : [];
 
+    const index = licences.findIndex(l => l.opticien?.email === email);
     if (index === -1) {
       return res.status(404).json({ error: "Licence introuvable" });
     }
 
     const mandate = licences[index].mandate;
+    if (!mandate) {
+      return res.status(400).json({ error: "Aucun mandat associé à cette licence" });
+    }
 
+    // Paiement via GoCardless
     const response = await fetch(`${GO_CARDLESS_API_BASE}/payments`, {
       method: 'POST',
       headers: {
@@ -418,11 +359,15 @@ app.post('/achat-credits-gocardless', async (req, res) => {
       },
       body: JSON.stringify({
         payments: {
-          amount: 6 * qty * 100,
+          amount: 6 * qty * 100, // montant en centimes
           currency: 'EUR',
           links: { mandate },
           description: `Achat ponctuel de ${qty * 100} crédits SMS - OptiCOM`,
-          metadata: { email, type: 'achat-credits', quantity: qty.toString() }
+          metadata: {
+            email,
+            type: 'achat-credits',
+            quantity: qty.toString()
+          }
         }
       })
     });
@@ -430,38 +375,41 @@ app.post('/achat-credits-gocardless', async (req, res) => {
     const data = await response.json();
 
     if (!response.ok) {
-      console.error('❗ Erreur paiement GoCardless :', data);
-      return res.status(500).json({ error: 'Paiement échoué' });
+      console.error('❗ Erreur GoCardless :', JSON.stringify(data, null, 2));
+      return res.status(500).json({ error: 'Échec du paiement GoCardless.' });
     }
 
-    licences[index].credits += qty * 100;
-    fs.writeFileSync('./licences.json', JSON.stringify(licences, null, 2));
+    // Ajout des crédits
+    const creditsAjoutes = qty * 100;
+    licences[index].credits += creditsAjoutes;
+    fs.writeFileSync(pathLicences, JSON.stringify(licences, null, 2));
 
-    // Génération automatique de la facture PDF
+    // Générer facture
     const facturePayload = {
       opticien: licences[index].opticien,
       type: 'Achat de crédits SMS (GoCardless)',
-      montant: 6 * qty,
-      details: `${qty * 100} crédits achetés`
+      montant: 6 * qty, // en euros
+      details: `${creditsAjoutes} crédits achetés via GoCardless`
     };
 
-    fetch(`http://localhost:${PORT}/api/generate-invoice`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(facturePayload)
-    })
-      .then(res => res.json())
-      .then(data => {
-        console.log(`📄 Facture générée : ${data.url}`);
-      })
-      .catch(err => {
-        console.error('❌ Erreur génération facture GoCardless :', err);
+    try {
+      const factureResponse = await fetch(`http://localhost:${PORT}/api/generate-invoice`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(facturePayload)
       });
 
-    res.json({ success: true, creditsAjoutes: qty * 100 });
+      const factureData = await factureResponse.json();
+      console.log(`📄 Facture générée automatiquement : ${factureData.url}`);
+    } catch (factureErr) {
+      console.error('❌ Erreur génération facture :', factureErr);
+    }
+
+    return res.json({ success: true, creditsAjoutes });
+
   } catch (err) {
-    console.error('❗ Erreur achat GoCardless :', err);
-    res.status(500).json({ error: 'Erreur serveur' });
+    console.error('❗ Erreur achat GoCardless (serveur) :', err);
+    return res.status(500).json({ error: 'Erreur serveur inattendue' });
   }
 });
 
@@ -501,7 +449,7 @@ app.post('/create-checkout-session', async (req, res) => {
 });
 
 // === Webhook Stripe pour ajout de crédits ===
-app.post('/webhook-stripe', (req, res) => {
+app.post('/webhook-stripe', express.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
   const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
   let event;
@@ -525,36 +473,47 @@ app.post('/webhook-stripe', (req, res) => {
     const index = licences.findIndex(l => l.opticien?.email === email);
 
     if (index !== -1) {
-      licences[index].credits = (licences[index].credits || 0) + (100 * quantity);
-      fs.writeFileSync(pathLic, JSON.stringify(licences, null, 2));
-      console.log(`✅ ${100 * quantity} crédits ajoutés à ${email}`);
+      // 1. Ajouter les crédits
+      const creditsAjoutes = 100 * quantity;
+      licences[index].credits = (licences[index].credits || 0) + creditsAjoutes;
 
-      // Génération de la facture
+      // 2. Générer la facture
       const facturePayload = {
         opticien: licences[index].opticien,
         type: 'Achat de crédits SMS (Stripe)',
         montant: 17 * quantity,
-        details: `${100 * quantity} crédits achetés`
+        details: `${creditsAjoutes} crédits achetés`
       };
 
-      fetch(`http://localhost:${PORT}/api/generate-invoice`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(facturePayload)
-      })
-        .then(r => r.json())
-        .then(data => console.log(`📄 Facture générée : ${data.url}`))
-        .catch(err => console.error('❌ Erreur facture Stripe :', err));
+      try {
+        const response = await fetch(`http://localhost:${PORT}/api/generate-invoice`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(facturePayload),
+        });
+
+        const data = await response.json();
+
+        // 3. Sauvegarder le lien de la facture dans la licence
+        if (!licences[index].factures) licences[index].factures = [];
+        licences[index].factures.push({
+          date: new Date().toISOString(),
+          url: data.url,
+          type: 'Stripe',
+          montant: 17 * quantity,
+          credits: creditsAjoutes
+        });
+
+        fs.writeFileSync(pathLic, JSON.stringify(licences, null, 2));
+        console.log(`✅ ${creditsAjoutes} crédits ajoutés + facture générée pour ${email}`);
+      } catch (err) {
+        console.error('❌ Erreur génération facture Stripe :', err);
+      }
     }
   }
 
   res.status(200).send('OK');
 });
-
-
-// === Servir les factures et licences ===
-app.use('/factures', express.static(path.join(__dirname, 'public/factures')));
-app.use('/licences.json', express.static(path.join(__dirname, 'licences.json')));
 
 // === Génération d'une facture PDF ===
 app.post('/api/generate-invoice', (req, res) => {
@@ -602,28 +561,6 @@ app.post('/api/generate-invoice', (req, res) => {
         console.warn(`⚠️ Opticien ID ${opticien.id} introuvable dans licences.json`);
       }
 
-      // Envoi automatique de la facture par email
-      const mailOptions = {
-        from: `"OptiCOM" <${process.env.SMTP_USER}>`,
-        to: opticien.email,
-        subject: `Votre facture OptiCOM - ${new Date().toLocaleDateString('fr-FR')}`,
-        text: `Bonjour ${opticien.prenom},\n\nVeuillez trouver ci-joint votre facture OptiCOM.\n\nType : ${type}\nMontant : ${montant.toFixed(2)} €\n\nCordialement,\nL’équipe OptiCOM`,
-        attachments: [
-          {
-            filename: fileName,
-            path: filePath,
-          },
-        ],
-      };
-
-      transporter.sendMail(mailOptions, (err, info) => {
-        if (err) {
-          console.error('❌ Erreur envoi email facture :', err);
-        } else {
-          console.log(`📧 Facture envoyée à ${opticien.email}`);
-        }
-      });
-
       res.json({ url: `/factures/${fileName}` });
     } catch (err) {
       console.error('❌ Erreur mise à jour licences.json :', err);
@@ -637,10 +574,19 @@ app.post('/api/generate-invoice', (req, res) => {
   });
 });
 
-
-// Envoi d’un SMS transactionnel (lunettes prêtes, SAV...)
 app.post('/send-transactional', async (req, res) => {
-  const { phoneNumber, message, senderLabel } = req.body;
+  const { phoneNumber, message, senderLabel, opticienId } = req.body;
+
+  if (!opticienId) return res.status(400).json({ success: false, error: 'Opticien ID manquant' });
+
+  const licences = chargerLicences();
+  const index = licences.findIndex(l => l.opticien?.id === opticienId);
+
+  if (index === -1) return res.status(404).json({ success: false, error: 'Licence introuvable' });
+
+  if ((licences[index].credits || 0) <= 0) {
+    return res.status(403).json({ success: false, error: 'Crédits épuisés' });
+  }
 
   try {
     const response = await axios.post(
@@ -656,6 +602,10 @@ app.post('/send-transactional', async (req, res) => {
       }
     );
 
+    // Décrémenter 1 crédit
+    licences[index].credits -= 1;
+    enregistrerLicences(licences);
+
     res.json({ success: true, data: response.data });
   } catch (error) {
     console.error('Erreur SMS transactionnel :', error.message);
@@ -663,10 +613,19 @@ app.post('/send-transactional', async (req, res) => {
   }
 });
 
-
-// Envoi d’un SMS promotionnel (Noël, soldes...)
 app.post('/send-promotional', async (req, res) => {
-  const { phoneNumber, message, senderLabel } = req.body;
+  const { phoneNumber, message, senderLabel, opticienId } = req.body;
+
+  if (!opticienId) return res.status(400).json({ success: false, error: 'Opticien ID manquant' });
+
+  const licences = chargerLicences();
+  const index = licences.findIndex(l => l.opticien?.id === opticienId);
+
+  if (index === -1) return res.status(404).json({ success: false, error: 'Licence introuvable' });
+
+  if ((licences[index].credits || 0) <= 0) {
+    return res.status(403).json({ success: false, error: 'Crédits épuisés' });
+  }
 
   try {
     const response = await axios.post(
@@ -682,6 +641,10 @@ app.post('/send-promotional', async (req, res) => {
       }
     );
 
+    // Décrémenter 1 crédit
+    licences[index].credits -= 1;
+    enregistrerLicences(licences);
+
     res.json({ success: true, data: response.data });
   } catch (error) {
     console.error('Erreur SMS promotionnel :', error.message);
@@ -690,10 +653,33 @@ app.post('/send-promotional', async (req, res) => {
 });
 
 
+// === Récupérer les crédits restants d’un opticien ===
+app.get('/api/credits/:opticienId', (req, res) => {
+  const { opticienId } = req.params;
+
+  if (!opticienId) {
+    return res.status(400).json({ error: 'ID opticien manquant.' });
+  }
+
+  const pathLic = path.join(__dirname, 'licences.json');
+  if (!fs.existsSync(pathLic)) {
+    return res.status(500).json({ error: 'Fichier licences.json introuvable.' });
+  }
+
+  const licences = JSON.parse(fs.readFileSync(pathLic, 'utf-8'));
+  const licence = licences.find(l => l.opticien?.id === opticienId);
+
+  if (!licence) {
+    return res.status(404).json({ error: 'Opticien introuvable.' });
+  }
+
+  res.json({ credits: licence.credits || 0 });
+});
+
+
+
 // === Lancement serveur ===
 app.listen(PORT, () => {
   console.log(`✅ Serveur prêt sur http://localhost:${PORT}`);
 });
-
-
 
