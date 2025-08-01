@@ -98,6 +98,7 @@ async function enregistrerLicenceEtSync(info, customer, mandate) {
 // 🍪 Cookies
 const cookieParser = require('cookie-parser');
 app.use(cookieParser());
+app.use(express.static('public'));
 
 // 🧪 Test serveur
 app.get('/', (req, res) => {
@@ -116,7 +117,7 @@ app.get('/create-redirect-flow', async (req, res) => {
     const redirectFlow = await gocardlessClient.redirectFlows.create({
       description: 'Mandat OptiCOM',
       session_token: sessionToken,
-      success_redirect_url: 'https://opticom.vercel.app/confirm-mandat', // Change si besoin
+      success_redirect_url: 'https://opticom-sms-server.onrender.com/validation-mandat',
     });
 
     // 🍪 Stocke le token dans un cookie temporaire (10 min)
