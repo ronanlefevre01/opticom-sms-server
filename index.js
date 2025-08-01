@@ -106,7 +106,7 @@ app.get('/', (req, res) => {
 });
 
 // 🔐 GoCardless (mode sandbox, à passer en 'live' pour production)
-const goCardless = require('gocardless-nodejs');
+
 const gocardlessClient = goCardless(process.env.GOCARDLESS_API_KEY, 'sandbox'); // ou 'live'
 
 // 🧭 Route de création du redirect flow GoCardless
