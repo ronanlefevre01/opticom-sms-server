@@ -106,7 +106,6 @@ app.get('/', (req, res) => {
 });
 
 // 🔐 GoCardless (mode sandbox, à passer en 'live' pour production)
-const gocardless = require('gocardless-nodejs');
 const gocardlessClient = gocardless(process.env.GOCARDLESS_API_KEY, 'sandbox'); // ou 'live'
 
 // 🧭 Route de création du redirect flow GoCardless
@@ -162,15 +161,36 @@ app.post('/create-mandat', async (req, res) => {
       }
     };
 
-    const response = await fetch(`${GO_CARDLESS_API_BASE}/redirect_flows`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${process.env.GOCARDLESS_API_KEY}`,
-        'GoCardless-Version': '2015-07-06'
-      },
-      body: JSON.stringify(redirectFlowData)
-    });
+    // Crée le redirect flow côté GoCardless
+const response = await fetch(`${GO_CARDLESS_API_BASE}/redirect_flows`, {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${process.env.GOCARDLESS_API_KEY}`,
+    'GoCardless-Version': '2015-07-06'
+  },
+  body: JSON.stringify({
+    redirect_flows: {
+      description: `Abonnement ${formule} - OptiCOM`,
+      session_token,
+      success_redirect_url: `opticom://validation-mandat`, // On ajoutera le redirect_flow_id après
+      prefilled_customer: customerData,
+      metadata: { formule, siret, telephone }
+    }
+  })
+});
+
+const json = await response.json();
+const redirectFlow = json.redirect_flows;
+
+// Enregistre le token pour plus tard
+redirectSessionMap.set(redirectFlow.id, session_token);
+
+// Maintenant tu peux renvoyer l’URL complète avec le bon ID
+const redirectUrl = `${redirectFlow.redirect_url}&redirect_flow_id=${redirectFlow.id}&session_token=${session_token}`;
+
+res.json({ redirect_url: redirectUrl });
+
 
     const data = await response.json();
 
@@ -192,49 +212,32 @@ app.post('/create-mandat', async (req, res) => {
 
 
 app.post('/confirm-mandat', async (req, res) => {
-  const { redirect_flow_id } = req.body;
-
-  if (!redirect_flow_id) {
-    return res.status(400).json({ error: 'Paramètre manquant: redirect_flow_id' });
-  }
-
-  const session_token = redirectSessionMap[redirect_flow_id];
-  if (!session_token) {
-    return res.status(400).send('Session token introuvable pour ce redirect flow.');
-  }
-
   try {
-    const response = await fetch(`${GO_CARDLESS_API_BASE}/redirect_flows/${redirect_flow_id}/actions/complete`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${process.env.GOCARDLESS_API_KEY}`,
-        'GoCardless-Version': '2015-07-06',
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ session_token })
-    });
+    const { redirect_flow_id } = req.body;
+    const session_token = redirectSessionMap.get(redirect_flow_id); // récupère le token lié
 
-    const data = await response.json();
-
-    if (!response.ok || !data.redirect_flow?.links) {
-      console.error('❗Erreur GoCardless (confirmation) :', data);
-      return res.status(500).json({ error: 'Échec confirmation mandat GoCardless.' });
+    if (!redirect_flow_id || !session_token) {
+      return res.status(400).json({ error: "Paramètres manquants" });
     }
 
-    const customer = data.redirect_flow.links.customer;
-    const mandate = data.redirect_flow.links.mandate;
-    const info = data.redirect_flow;
+    const completed = await gocardlessClient.redirectFlows.complete(redirect_flow_id, {
+      params: { session_token },
+    });
 
-    const licence = await enregistrerLicenceEtSync(info, customer, mandate);
+    const mandateId = completed.links.mandate;
+    const customerId = completed.links.customer;
 
-    delete redirectSessionMap[redirect_flow_id];
+    // Ici tu génères la licence (à adapter selon ton code)
+    const licence = generateLicenceForCustomer(customerId);
 
     res.json({ success: true, licence });
-  } catch (err) {
-    console.error('❗Erreur serveur POST /confirm-mandat :', err);
-    res.status(500).json({ error: 'Erreur serveur' });
+
+  } catch (error) {
+    console.error('Exception GoCardless:', error);
+    res.status(500).json({ error: 'Erreur lors de la confirmation du mandat.' });
   }
 });
+
 
 
 app.get('/validation-mandat', async (req, res) => {
