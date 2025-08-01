@@ -9,7 +9,7 @@ const { v4: uuidv4 } = require('uuid');
 const axios = require('axios');
 const PDFDocument = require('pdfkit');
 const crypto = require('crypto');
-const redirectSessionMap = {}; // { redirectFlowId: session_token }
+const redirectSessionMap = new Map();
 const goCardless = require('gocardless-nodejs');
 
 
