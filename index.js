@@ -9,7 +9,6 @@ const { v4: uuidv4 } = require('uuid');
 const axios = require('axios');
 const PDFDocument = require('pdfkit');
 const crypto = require('crypto');
-const redirectSessionMap = new Map();
 const goCardless = require('gocardless-nodejs');
 
 
@@ -179,8 +178,6 @@ app.post('/create-mandat', async (req, res) => {
 
     const redirectFlow = data.redirect_flows;
 
-    // 🧠 Stocke le token pour validation ultérieure
-    redirectSessionMap.set(redirectFlow.id, session_token);
 
     // 🔁 Redirige vers GoCardless
     const redirectUrl = `${redirectFlow.redirect_url}?redirect_flow_id=${redirectFlow.id}&session_token=${session_token}`;
