@@ -156,7 +156,7 @@ app.post('/create-mandat', async (req, res) => {
       redirect_flows: {
         description: `Abonnement ${formule} - OptiCOM`,
         session_token,
-        success_redirect_url: "opticom://MandateValidationPage",
+        success_redirect_url: 'https://opticom-sms-server.onrender.com/validation-mandat',
         prefilled_customer: customerData,
         metadata: { formule, siret, telephone }
       }
