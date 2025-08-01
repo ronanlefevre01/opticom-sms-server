@@ -10,6 +10,8 @@ const axios = require('axios');
 const PDFDocument = require('pdfkit');
 const crypto = require('crypto');
 const redirectSessionMap = {}; // { redirectFlowId: session_token }
+const goCardless = require('gocardless-nodejs');
+
 
 
 // Chargement conditionnel de node-fetch (compatible avec ES6)
@@ -153,7 +155,7 @@ app.post('/create-mandat', async (req, res) => {
       redirect_flows: {
         description: `Abonnement ${formule} - OptiCOM`,
         session_token,
-        success_redirect_url: "https://opticom-sms-server.onrender.com/validation-mandat",
+        success_redirect_url: "opticom://MandateValidationPage",
         prefilled_customer: customerData,
         metadata: { formule, siret, telephone }
       }
@@ -238,8 +240,12 @@ app.get('/validation-mandat', async (req, res) => {
   try {
     const { redirect_flow_id, session_token } = req.query;
 
+    if (!redirect_flow_id || !session_token) {
+      return res.status(400).json({ error: 'Paramètres manquants.' });
+    }
+
     const completed = await goCardless.redirectFlows.complete(redirect_flow_id, {
-      params: { session_token }
+      params: { session_token },
     });
 
     const customerId = completed.links.customer;
@@ -247,40 +253,55 @@ app.get('/validation-mandat', async (req, res) => {
     const customer = customerResponse.customer;
 
     if (!customer) {
-      return res.status(500).send('Erreur : client GoCardless introuvable.');
+      return res.status(500).json({ error: 'Client GoCardless introuvable.' });
     }
 
-    // Générer une clé unique
-    const licenceId = uuidv4();
+    // Générer une clé d'activation unique
+    const licenceKey = uuidv4();
 
-    // Charger le fichier existant
-    const licencesPath = path.join(__dirname, 'licences.json');
-    const licences = JSON.parse(fs.readFileSync(licencesPath, 'utf8'));
+    // Construire le chemin vers licences.json
+    const licencesPath = path.join(__dirname, 'public', 'licences.json');
 
-    // Créer la licence
+    // Charger les licences existantes
+    let licences = [];
+    if (fs.existsSync(licencesPath)) {
+      licences = JSON.parse(fs.readFileSync(licencesPath, 'utf8')).licences || [];
+    }
+
+    // Créer la nouvelle licence
     const newLicence = {
-      id: licenceId,
+      id: licenceKey,
+      cle: licenceKey,
       nom: customer.family_name,
       prenom: customer.given_name,
       email: customer.email,
-      credits: 500, // ou selon la formule
-      formule: 'Pro',
-      dateDebut: new Date().toISOString(),
-      dateFin: new Date(new Date().setMonth(new Date().getMonth() + 1)).toISOString()
+      formule: 'pro', // ou starter/premium selon redirect flow metadata si dispo
+      creditsRestants: 300,
+      renouvellement: 'mensuel',
+      historique: [
+        {
+          date: new Date().toISOString(),
+          type: 'activation',
+          credits: 300,
+        },
+      ],
     };
 
-    // Ajouter à la liste
+    // Ajouter la licence à la liste
     licences.push(newLicence);
 
-    // Sauvegarder
-    fs.writeFileSync(licencesPath, JSON.stringify(licences, null, 2), 'utf8');
+    // Écrire le nouveau fichier licences.json
+    const newContent = { licences };
+    fs.writeFileSync(licencesPath, JSON.stringify(newContent, null, 2), 'utf8');
 
-    // Retourner la licence au front
+    console.log('✅ Licence créée avec succès pour :', customer.email);
+
+    // Renvoyer la licence au client
     res.json(newLicence);
 
   } catch (error) {
-    console.error('Erreur GET /validation-mandat :', error);
-    res.status(500).send('Erreur lors de la validation du mandat.');
+    console.error('❌ Erreur GET /validation-mandat :', error);
+    res.status(500).json({ error: 'Erreur lors de la validation du mandat.' });
   }
 });
 
