@@ -156,7 +156,7 @@ app.post('/create-mandat', async (req, res) => {
       redirect_flows: {
         description: `Abonnement ${formule} - OptiCOM`,
         session_token,
-        success_redirect_url: 'https://opticom-sms-server.onrender.com/validation-mandat',
+        success_redirect_url: `opticom://validation-mandat?redirect_flow_id=${redirectFlow.id}&session_token=${session_token}`,
         prefilled_customer: customerData,
         metadata: { formule, siret, telephone }
       }
@@ -245,39 +245,40 @@ app.get('/validation-mandat', async (req, res) => {
       return res.status(400).json({ error: 'Paramètres manquants.' });
     }
 
+    // Finalise le redirect flow chez GoCardless
     const completed = await goCardless.redirectFlows.complete(redirect_flow_id, {
       params: { session_token },
     });
 
     const customerId = completed.links.customer;
-    const customerResponse = await goCardless.customers.find(customerId);
-    const customer = customerResponse.customer;
+    const { customer } = await goCardless.customers.find(customerId);
 
     if (!customer) {
       return res.status(500).json({ error: 'Client GoCardless introuvable.' });
     }
 
-    // Générer une clé d'activation unique
+    // Génération d’une clé de licence unique
     const licenceKey = uuidv4();
 
-    // Construire le chemin vers licences.json
     const licencesPath = path.join(__dirname, 'public', 'licences.json');
-
-    // Charger les licences existantes
     let licences = [];
+
+    // Charger les licences si fichier existant
     if (fs.existsSync(licencesPath)) {
-      licences = JSON.parse(fs.readFileSync(licencesPath, 'utf8')).licences || [];
+      const content = fs.readFileSync(licencesPath, 'utf8');
+      licences = JSON.parse(content).licences || [];
     }
 
-    // Créer la nouvelle licence
     const newLicence = {
       id: licenceKey,
       cle: licenceKey,
-      nom: customer.family_name,
-      prenom: customer.given_name,
-      email: customer.email,
-      formule: 'pro', // ou starter/premium selon redirect flow metadata si dispo
-      creditsRestants: 300,
+      opticien: {
+        nom: customer.family_name || '',
+        prenom: customer.given_name || '',
+        email: customer.email || '',
+      },
+      formule: 'pro',
+      credits: 300,
       renouvellement: 'mensuel',
       historique: [
         {
@@ -286,23 +287,22 @@ app.get('/validation-mandat', async (req, res) => {
           credits: 300,
         },
       ],
+      factures: [],
     };
 
-    // Ajouter la licence à la liste
     licences.push(newLicence);
 
-    // Écrire le nouveau fichier licences.json
-    const newContent = { licences };
-    fs.writeFileSync(licencesPath, JSON.stringify(newContent, null, 2), 'utf8');
+    const finalContent = { licences };
+    fs.writeFileSync(licencesPath, JSON.stringify(finalContent, null, 2), 'utf8');
 
-    console.log('✅ Licence créée avec succès pour :', customer.email);
+    console.log('✅ Nouvelle licence activée pour :', customer.email);
 
-    // Renvoyer la licence au client
-    res.json(newLicence);
+    // ✅ Renvoi structuré
+    return res.json(newLicence);
 
   } catch (error) {
-    console.error('❌ Erreur GET /validation-mandat :', error);
-    res.status(500).json({ error: 'Erreur lors de la validation du mandat.' });
+    console.error('❌ Erreur /validation-mandat :', error);
+    return res.status(500).json({ error: 'Erreur lors de la validation du mandat.' });
   }
 });
 
