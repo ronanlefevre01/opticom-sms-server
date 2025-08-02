@@ -186,11 +186,10 @@ app.get('/validation-mandat', async (req, res) => {
 
   try {
     // 1. Confirmer le mandat GoCardless
-    const confirmResponse = await goCardlessClient.redirectFlows.complete(redirectFlowId, {
-  data: {
-    session_token: sessionToken
-  }
+    goCardlessClient.redirectFlows.complete(redirectFlowId, {
+  session_token: sessionToken
 });
+
 
 
     console.log('✅ confirmResponse =', confirmResponse);
