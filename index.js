@@ -11,11 +11,7 @@ const PDFDocument = require('pdfkit');
 const crypto = require('crypto');
 const goCardless = require('gocardless-nodejs');
 const sessionTokenMap = new Map();
-const goCardlessClient = new goCardless.Client({
-  access_token: process.env.GOCARDLESS_API_KEY,
-  environment: process.env.GOCARDLESS_ENV || 'sandbox'
-});
-
+const goCardlessClient = goCardless(process.env.GOCARDLESS_API_KEY, process.env.GOCARDLESS_ENV || 'sandbox');
 
 
 // Chargement conditionnel de node-fetch (compatible avec ES6)
