@@ -122,13 +122,12 @@ app.post('/create-mandat', async (req, res) => {
     const session_token = uuidv4();
 
     const customerData = {
-      given_name: prenom?.trim(),
-      family_name: nom?.trim(),
-      email: email?.trim(),
-      address_line1: adresse?.trim(),
-      city: ville?.trim(),
-      postal_code: codePostal?.trim(),
-      country_code: pays && pays.length === 2 ? pays.toUpperCase() : 'FR',
+      email: 'email@entreprise.com',
+      organisation_name: 'Optique du Centre',
+      address_line1: '123 Rue de la Vue',
+      city: 'Paris',
+      postal_code: '75000',
+      country_code: 'FR'
     };
 
     // Créer le redirect flow via GoCardless API
