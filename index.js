@@ -188,6 +188,13 @@ app.get('/validation-mandat', async (req, res) => {
       params: { session_token: sessionToken }
     });
 
+    console.log('✅ confirmResponse =', confirmResponse);
+
+    if (!confirmResponse?.redirect_flows) {
+      console.error("❌ Erreur GoCardless : réponse invalide", confirmResponse);
+      return res.status(500).send("Erreur GoCardless : réponse invalide lors de la confirmation.");
+    }
+
     const customerId = confirmResponse.redirect_flows.links.customer;
     const mandateId = confirmResponse.redirect_flows.links.mandate;
 
@@ -221,7 +228,6 @@ app.get('/validation-mandat', async (req, res) => {
     const licencesPath = path.join(__dirname, 'public', 'licences.json');
     let licences = [];
 
-    // Lire le fichier s’il existe
     if (fs.existsSync(licencesPath)) {
       licences = JSON.parse(fs.readFileSync(licencesPath, 'utf8'));
     }
