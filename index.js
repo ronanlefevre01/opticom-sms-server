@@ -11,7 +11,10 @@ const PDFDocument = require('pdfkit');
 const crypto = require('crypto');
 const goCardless = require('gocardless-nodejs');
 const sessionTokenMap = new Map();
-const goCardlessClient = goCardless(process.env.GOCARDLESS_API_KEY, process.env.GOCARDLESS_ENV || 'sandbox');
+const goCardlessClient = goCardless(
+  process.env.GOCARDLESS_API_KEY,
+  process.env.GOCARDLESS_ENV || 'sandbox'
+);
 
 
 // Chargement conditionnel de node-fetch (compatible avec ES6)
@@ -190,13 +193,16 @@ app.get('/validation-mandat', async (req, res) => {
 
     console.log('✅ confirmResponse =', confirmResponse);
 
-    if (!confirmResponse?.redirect_flow) {
+    // ✅ Correction ici : utiliser redirect_flows au lieu de redirect_flow
+    const flow = confirmResponse?.redirect_flows;
+
+    if (!flow) {
       console.error("❌ Erreur GoCardless : réponse invalide", confirmResponse);
       return res.status(500).send("Erreur GoCardless : réponse invalide lors de la confirmation.");
     }
 
-    const customerId = confirmResponse.redirect_flow.links.customer;
-    const mandateId = confirmResponse.redirect_flow.links.mandate;
+    const customerId = flow.links.customer;
+    const mandateId = flow.links.mandate;
 
     // 2. Récupérer les données de l’opticien
     const opticien = sessionTokenMap.get(sessionToken);
@@ -214,16 +220,16 @@ app.get('/validation-mandat', async (req, res) => {
       abonnement: "Pro",
       credits: 100,
       opticien: {
-  nom: opticien.nom,
-  prenom: opticien.prenom,
-  email: opticien.email,
-  adresse: opticien.adresse,
-  ville: opticien.ville,
-  codePostal: opticien.codePostal,
-  pays: opticien.pays,
-  telephone: opticien.telephone,
-  siret: opticien.siret
-},
+        nom: opticien.nom,
+        prenom: opticien.prenom,
+        email: opticien.email,
+        adresse: opticien.adresse,
+        ville: opticien.ville,
+        codePostal: opticien.codePostal,
+        pays: opticien.pays,
+        telephone: opticien.telephone,
+        siret: opticien.siret
+      },
       mandateId,
       customerId
     };
