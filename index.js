@@ -186,25 +186,18 @@ app.get('/validation-mandat', async (req, res) => {
 
   try {
   const confirmResponse = await goCardlessClient.redirectFlows.complete(redirectFlowId, {
-    session_token: sessionToken
-  });
+  session_token: sessionToken,
+});
 
-  console.log('✅ confirmResponse =', confirmResponse);
+console.log("✅ confirmResponse =", confirmResponse);
 
-  const flow = confirmResponse?.redirect_flows;
-  if (!flow) {
-    console.error("❌ Erreur GoCardless : réponse invalide", confirmResponse);
-    return res.status(500).send("Erreur GoCardless : réponse invalide lors de la confirmation.");
-  }
-
-
-    // ✅ Correction ici : utiliser redirect_flows au lieu de redirect_flow
+const flow = confirmResponse; // ici on garde tout confirmResponse
+if (!flow || !flow.links || !flow.links.customer) {
+  console.error("❌ Erreur GoCardless : réponse invalide", confirmResponse);
+  return res.status(500).send("Erreur GoCardless : réponse invalide lors de la confirmation.");
+}
 
 
-    if (!flow) {
-      console.error("❌ Erreur GoCardless : réponse invalide", confirmResponse);
-      return res.status(500).send("Erreur GoCardless : réponse invalide lors de la confirmation.");
-    }
 
     const customerId = flow.links.customer;
     const mandateId = flow.links.mandate;
