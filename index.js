@@ -176,7 +176,7 @@ app.post('/create-mandat', async (req, res) => {
 
 app.get('/validation-mandat', async (req, res) => {
   const redirectFlowId = req.query.redirect_flow_id;
-  const sessionToken = redirectSessionMap[redirectFlowId];
+  const sessionToken = req.query.session_token;
 
   if (!redirectFlowId || !sessionToken) {
     return res.status(400).send('Paramètre manquant ou session expirée.');
@@ -191,11 +191,11 @@ app.get('/validation-mandat', async (req, res) => {
     const customerId = confirmResponse.redirect_flows.links.customer;
     const mandateId = confirmResponse.redirect_flows.links.mandate;
 
-    // 2. Récupérer le nom du client stocké temporairement
-    const opticien = sessionTokenMap[sessionToken]; // doit contenir nom, adresse, etc.
+    // 2. Récupérer les données de l’opticien
+    const opticien = sessionTokenMap.get(sessionToken);
 
     if (!opticien) {
-      return res.status(400).send('Données opticien manquantes.');
+      return res.status(400).send('Données opticien manquantes ou session expirée.');
     }
 
     // 3. Générer une licence unique
@@ -219,11 +219,20 @@ app.get('/validation-mandat', async (req, res) => {
 
     // 4. Enregistrer dans licences.json
     const licencesPath = path.join(__dirname, 'public', 'licences.json');
-    const licences = JSON.parse(fs.readFileSync(licencesPath, 'utf8'));
+    let licences = [];
+
+    // Lire le fichier s’il existe
+    if (fs.existsSync(licencesPath)) {
+      licences = JSON.parse(fs.readFileSync(licencesPath, 'utf8'));
+    }
+
     licences.push(newLicence);
     fs.writeFileSync(licencesPath, JSON.stringify(licences, null, 2));
 
-    // 5. Réponse HTML affichant la clé de licence
+    // 5. Nettoyer la session temporaire
+    sessionTokenMap.delete(sessionToken);
+
+    // 6. Réponse HTML affichant la licence
     res.send(`
       <html>
         <head>
@@ -246,14 +255,10 @@ app.get('/validation-mandat', async (req, res) => {
       </html>
     `);
   } catch (error) {
-    console.error(error);
+    console.error('❌ Erreur validation mandat :', error);
     res.status(500).send("Erreur lors de la validation du mandat.");
   }
 });
-
-
-
-
 
 
 
