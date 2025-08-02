@@ -11,7 +11,8 @@ const PDFDocument = require('pdfkit');
 const crypto = require('crypto');
 const goCardless = require('gocardless-nodejs');
 const sessionTokenMap = new Map();
-const goCardlessClient = goCardless(process.env.GOCARDLESS_API_KEY, {
+const goCardlessClient = new gocardless.Client({
+  access_token: process.env.GOCARDLESS_API_KEY,
   environment: process.env.GOCARDLESS_ENV || 'sandbox'
 });
 
@@ -188,19 +189,18 @@ app.get('/validation-mandat', async (req, res) => {
   try {
     // 1. Confirmer le mandat GoCardless
     const confirmResponse = await goCardlessClient.redirectFlows.complete(redirectFlowId, {
-  params: { session_token: sessionToken }
-});
-
+      params: { session_token: sessionToken }
+    });
 
     console.log('✅ confirmResponse =', confirmResponse);
 
-    if (!confirmResponse?.redirect_flows) {
+    if (!confirmResponse?.redirect_flow) {
       console.error("❌ Erreur GoCardless : réponse invalide", confirmResponse);
       return res.status(500).send("Erreur GoCardless : réponse invalide lors de la confirmation.");
     }
 
-    const customerId = confirmResponse.redirect_flows.links.customer;
-    const mandateId = confirmResponse.redirect_flows.links.mandate;
+    const customerId = confirmResponse.redirect_flow.links.customer;
+    const mandateId = confirmResponse.redirect_flow.links.mandate;
 
     // 2. Récupérer les données de l’opticien
     const opticien = sessionTokenMap.get(sessionToken);
@@ -218,12 +218,16 @@ app.get('/validation-mandat', async (req, res) => {
       abonnement: "Pro",
       credits: 100,
       opticien: {
-        nom: opticien.nom,
-        adresse: opticien.adresse,
-        telephone: opticien.telephone,
-        email: opticien.email,
-        siret: opticien.siret
-      },
+  nom: opticien.nom,
+  prenom: opticien.prenom,
+  email: opticien.email,
+  adresse: opticien.adresse,
+  ville: opticien.ville,
+  codePostal: opticien.codePostal,
+  pays: opticien.pays,
+  telephone: opticien.telephone,
+  siret: opticien.siret
+},
       mandateId,
       customerId
     };
@@ -265,11 +269,10 @@ app.get('/validation-mandat', async (req, res) => {
       </html>
     `);
   } catch (error) {
-    console.error('❌ Erreur validation mandat :', error);
+    console.error('❌ Erreur validation mandat :', error?.error || error);
     res.status(500).send("Erreur lors de la validation du mandat.");
   }
 });
-
 
 
 app.post('/send-sms', async (req, res) => {
