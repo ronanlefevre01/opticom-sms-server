@@ -233,15 +233,30 @@ if (!flow || !flow.links || !flow.links.customer) {
     };
 
     // 4. Enregistrer dans licences.json
-    const licencesPath = path.join(__dirname, 'public', 'licences.json');
-    let licences = [];
+    
+const binId = process.env.JSONBIN_BIN_ID;
+const apiKey = process.env.JSONBIN_API_KEY;
 
-    if (fs.existsSync(licencesPath)) {
-      licences = JSON.parse(fs.readFileSync(licencesPath, 'utf8'));
-    }
+// 1. Récupérer les licences existantes
+const getResponse = await axios.get(`https://api.jsonbin.io/v3/b/${binId}/latest`, {
+  headers: {
+    'X-Master-Key': apiKey
+  }
+});
 
-    licences.push(newLicence);
-    fs.writeFileSync(licencesPath, JSON.stringify(licences, null, 2));
+let licences = getResponse.data.record || [];
+licences.push(newLicence);
+
+// 2. Enregistrer les licences mises à jour
+await axios.put(`https://api.jsonbin.io/v3/b/${binId}`, licences, {
+  headers: {
+    'Content-Type': 'application/json',
+    'X-Master-Key': apiKey,
+    'X-Bin-Versioning': 'false' // désactive les versions à chaque écriture (optionnel)
+  }
+});
+
+
 
     // 5. Nettoyer la session temporaire
     sessionTokenMap.delete(sessionToken);
