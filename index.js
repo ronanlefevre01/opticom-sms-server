@@ -261,6 +261,11 @@ await axios.put(`https://api.jsonbin.io/v3/b/${binId}`, licences, {
     // 5. Nettoyer la session temporaire
     sessionTokenMap.delete(sessionToken);
 
+    // 🔸 Si c'est une requête JSON (depuis l'app mobile)
+if (req.headers.accept?.includes('application/json')) {
+  return res.json(newLicence);
+}
+
     // 6. Réponse HTML affichant la licence
     res.send(`
       <html>
