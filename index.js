@@ -16,6 +16,13 @@ const goCardlessClient = goCardless(
   process.env.GOCARDLESS_ENV || 'live'
 );
 
+const formulas = [
+  { id: 'starter', name: 'Starter', credits: 100 },
+  { id: 'pro', name: 'Pro', credits: 300 },
+  { id: 'premium', name: 'Premium', credits: 600 },
+  { id: 'alacarte', name: 'À la carte', credits: 0 }, // pas concerné ici
+];
+
 
 // Chargement conditionnel de node-fetch (compatible avec ES6)
 const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
@@ -122,13 +129,14 @@ app.post('/create-mandat', async (req, res) => {
     const session_token = uuidv4();
 
     const customerData = {
-      email: 'email@entreprise.com',
-      company_name: 'Optique du Centre',
-      address_line1: '123 Rue de la Vue',
-      city: 'Paris',
-      postal_code: '75000',
-      country_code: 'FR'
-    };
+  email: email,
+  company_name: nom,           // ou `${prenom} ${nom}` si tu veux afficher le nom du gérant
+  address_line1: adresse,
+  city: ville,
+  postal_code: codePostal,
+  country_code: pays || 'FR',  // par défaut à FR si non fourni
+};
+
 
     // Créer le redirect flow via GoCardless API
     const response = await fetch(`${GO_CARDLESS_API_BASE}/redirect_flows`, {
@@ -185,38 +193,40 @@ app.get('/validation-mandat', async (req, res) => {
   }
 
   try {
-  const confirmResponse = await goCardlessClient.redirectFlows.complete(redirectFlowId, {
-  session_token: sessionToken,
-});
+    const confirmResponse = await goCardlessClient.redirectFlows.complete(redirectFlowId, {
+      session_token: sessionToken,
+    });
 
-console.log("✅ confirmResponse =", confirmResponse);
+    console.log("✅ confirmResponse =", confirmResponse);
 
-const flow = confirmResponse; // ici on garde tout confirmResponse
-if (!flow || !flow.links || !flow.links.customer) {
-  console.error("❌ Erreur GoCardless : réponse invalide", confirmResponse);
-  return res.status(500).send("Erreur GoCardless : réponse invalide lors de la confirmation.");
-}
-
-
+    const flow = confirmResponse;
+    if (!flow || !flow.links || !flow.links.customer) {
+      console.error("❌ Erreur GoCardless : réponse invalide", confirmResponse);
+      return res.status(500).send("Erreur GoCardless : réponse invalide lors de la confirmation.");
+    }
 
     const customerId = flow.links.customer;
     const mandateId = flow.links.mandate;
 
-    // 2. Récupérer les données de l’opticien
+    // 🔸 Récupérer les données de l’opticien
     const opticien = sessionTokenMap.get(sessionToken);
-
     if (!opticien) {
       return res.status(400).send('Données opticien manquantes ou session expirée.');
     }
 
-    // 3. Générer une licence unique
+    // 🔸 Trouver la formule choisie (grâce au tableau global `formulas`)
+    const selectedFormule = formulas.find(f => f.id === opticien.formule) || { name: "Formule inconnue", credits: 0 };
+    const abonnement = selectedFormule.name;
+    const credits = selectedFormule.credits;
+
+    // 🔸 Générer la licence
     const licenceKey = uuidv4();
     const newLicence = {
       id: uuidv4(),
       licence: licenceKey,
       dateCreation: new Date().toISOString(),
-      abonnement: "Pro",
-      credits: 100,
+      abonnement,
+      credits,
       opticien: {
         nom: opticien.nom,
         prenom: opticien.prenom,
@@ -232,41 +242,33 @@ if (!flow || !flow.links || !flow.links.customer) {
       customerId
     };
 
-    // 4. Enregistrer dans licences.json
-    
-const binId = process.env.JSONBIN_BIN_ID;
-const apiKey = process.env.JSONBIN_API_KEY;
+    // 🔸 Enregistrement sur JSONBin
+    const binId = process.env.JSONBIN_BIN_ID;
+    const apiKey = process.env.JSONBIN_API_KEY;
 
-// 1. Récupérer les licences existantes
-const getResponse = await axios.get(`https://api.jsonbin.io/v3/b/${binId}/latest`, {
-  headers: {
-    'X-Master-Key': apiKey
-  }
-});
+    const getResponse = await axios.get(`https://api.jsonbin.io/v3/b/${binId}/latest`, {
+      headers: { 'X-Master-Key': apiKey }
+    });
 
-let licences = getResponse.data.record || [];
-licences.push(newLicence);
+    let licences = getResponse.data.record || [];
+    licences.push(newLicence);
 
-// 2. Enregistrer les licences mises à jour
-await axios.put(`https://api.jsonbin.io/v3/b/${binId}`, licences, {
-  headers: {
-    'Content-Type': 'application/json',
-    'X-Master-Key': apiKey,
-    'X-Bin-Versioning': 'false' // désactive les versions à chaque écriture (optionnel)
-  }
-});
+    await axios.put(`https://api.jsonbin.io/v3/b/${binId}`, licences, {
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Master-Key': apiKey,
+        'X-Bin-Versioning': 'false'
+      }
+    });
 
-
-
-    // 5. Nettoyer la session temporaire
     sessionTokenMap.delete(sessionToken);
 
-    // 🔸 Si c'est une requête JSON (depuis l'app mobile)
-if (req.headers.accept?.includes('application/json')) {
-  return res.json(newLicence);
-}
+    // 🔸 Réponse JSON (si appelée depuis l'app)
+    if (req.headers.accept?.includes('application/json')) {
+      return res.json(newLicence);
+    }
 
-    // 6. Réponse HTML affichant la licence
+    // 🔸 Réponse HTML (navigateur)
     res.send(`
       <html>
         <head>
@@ -293,6 +295,7 @@ if (req.headers.accept?.includes('application/json')) {
     res.status(500).send("Erreur lors de la validation du mandat.");
   }
 });
+
 
 
 app.post('/send-sms', async (req, res) => {
