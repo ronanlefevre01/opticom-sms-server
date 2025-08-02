@@ -140,7 +140,7 @@ app.post('/create-mandat', async (req, res) => {
         redirect_flows: {
           description: `Abonnement ${formule} - OptiCOM`,
           session_token,
-          success_redirect_url: 'https://opticom-sms-server.onrender.com/validation-mandat',
+          success_redirect_url: `https://opticom-sms-server.onrender.com/validation-mandat?session_token=${session_token}`,
           prefilled_customer: customerData,
           metadata: { formule, siret, telephone }
         }
@@ -163,7 +163,7 @@ app.post('/create-mandat', async (req, res) => {
     });
 
     // 🔁 Redirige vers GoCardless pour signature
-    const redirectUrl = `${redirectFlow.redirect_url}?redirect_flow_id=${redirectFlow.id}&session_token=${session_token}`;
+    const redirectUrl = redirectFlow.redirect_url;
     res.status(200).json({ url: redirectUrl });
 
   } catch (err) {
