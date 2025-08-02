@@ -123,7 +123,7 @@ app.post('/create-mandat', async (req, res) => {
 
     const customerData = {
       email: 'email@entreprise.com',
-      organisation_name: 'Optique du Centre',
+      company_name: 'Optique du Centre',
       address_line1: '123 Rue de la Vue',
       city: 'Paris',
       postal_code: '75000',
