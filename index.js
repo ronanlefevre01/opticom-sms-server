@@ -248,7 +248,8 @@ app.get('/validation-mandat', async (req, res) => {
     console.log('✅ Licence créée pour :', customer.email);
 
     // ✅ Redirection vers l’application mobile avec la licence
-    return res.redirect(`opticom://validation-mandat?licence=${licenceKey}`);
+    return res.redirect(`opticom://MandateValidationPage?licence=${licenceKey}`);
+
 
   } catch (error) {
     console.error('❌ Erreur /validation-mandat :', error);
