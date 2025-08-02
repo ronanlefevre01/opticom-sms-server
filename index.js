@@ -11,6 +11,8 @@ const PDFDocument = require('pdfkit');
 const crypto = require('crypto');
 const goCardless = require('gocardless-nodejs');
 const sessionTokenMap = new Map();
+const goCardlessClient = goCardless(process.env.GOCARDLESS_API_KEY, process.env.GOCARDLESS_ENV || 'sandbox');
+
 
 
 
@@ -184,9 +186,10 @@ app.get('/validation-mandat', async (req, res) => {
 
   try {
     // 1. Confirmer le mandat GoCardless
-    const confirmResponse = await goCardless.redirectFlows.complete(redirectFlowId, {
-      params: { session_token: sessionToken }
-    });
+    const confirmResponse = await goCardlessClient.redirectFlows.complete(redirectFlowId, {
+  params: { session_token: sessionToken }
+});
+
 
     console.log('✅ confirmResponse =', confirmResponse);
 
