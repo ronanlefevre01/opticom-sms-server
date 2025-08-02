@@ -10,6 +10,7 @@ const axios = require('axios');
 const PDFDocument = require('pdfkit');
 const crypto = require('crypto');
 const goCardless = require('gocardless-nodejs');
+const sessionTokenMap = new Map();
 
 
 
@@ -104,31 +105,7 @@ app.get('/', (req, res) => {
   res.send('✅ Serveur OptiCOM en ligne');
 });
 
-// 🔐 GoCardless (mode sandbox, à passer en 'live' pour production)
 
-const gocardlessClient = goCardless(process.env.GOCARDLESS_API_KEY, 'sandbox'); // ou 'live'
-
-// 🧭 Route de création du redirect flow GoCardless
-app.get('/create-redirect-flow', async (req, res) => {
-  const sessionToken = uuidv4();
-
-  try {
-    const redirectFlow = await gocardlessClient.redirectFlows.create({
-      description: 'Mandat OptiCOM',
-      session_token: sessionToken,
-      success_redirect_url: 'https://opticom-sms-server.onrender.com/validation-mandat',
-    });
-
-    // 🍪 Stocke le token dans un cookie temporaire (10 min)
-    res.cookie('session_token', sessionToken, { maxAge: 10 * 60 * 1000, httpOnly: true });
-
-    // 🔁 Redirige le navigateur vers GoCardless pour signature du mandat
-    res.redirect(redirectFlow.redirect_url);
-  } catch (error) {
-    console.error('❌ Erreur lors de la création du redirect flow GoCardless:', error.message);
-    res.status(500).send('Erreur création du redirect flow');
-  }
-});
 
 // === 🔐 Créer un mandat GoCardless ===
 
@@ -139,7 +116,7 @@ app.post('/create-mandat', async (req, res) => {
   } = req.body;
 
   try {
-    const session_token = crypto.randomUUID();
+    const session_token = uuidv4();
 
     const customerData = {
       given_name: prenom?.trim(),
@@ -151,6 +128,7 @@ app.post('/create-mandat', async (req, res) => {
       country_code: pays && pays.length === 2 ? pays.toUpperCase() : 'FR',
     };
 
+    // Créer le redirect flow via GoCardless API
     const response = await fetch(`${GO_CARDLESS_API_BASE}/redirect_flows`, {
       method: 'POST',
       headers: {
@@ -178,8 +156,13 @@ app.post('/create-mandat', async (req, res) => {
 
     const redirectFlow = data.redirect_flows;
 
+    // 🧠 Stocke temporairement les infos opticien associées au session_token
+    sessionTokenMap.set(session_token, {
+      nom, prenom, email, adresse, ville,
+      codePostal, pays, formule, siret, telephone
+    });
 
-    // 🔁 Redirige vers GoCardless
+    // 🔁 Redirige vers GoCardless pour signature
     const redirectUrl = `${redirectFlow.redirect_url}?redirect_flow_id=${redirectFlow.id}&session_token=${session_token}`;
     res.status(200).json({ url: redirectUrl });
 
@@ -190,72 +173,84 @@ app.post('/create-mandat', async (req, res) => {
 });
 
 
+
 app.get('/validation-mandat', async (req, res) => {
+  const redirectFlowId = req.query.redirect_flow_id;
+  const sessionToken = redirectSessionMap[redirectFlowId];
+
+  if (!redirectFlowId || !sessionToken) {
+    return res.status(400).send('Paramètre manquant ou session expirée.');
+  }
+
   try {
-    const { redirect_flow_id, session_token } = req.query;
-
-    if (!redirect_flow_id || !session_token) {
-      return res.status(400).json({ error: 'Paramètres manquants.' });
-    }
-
-    // 🔐 Finalise le redirect flow GoCardless
-    const completed = await goCardless.redirectFlows.complete(redirect_flow_id, {
-      params: { session_token },
+    // 1. Confirmer le mandat GoCardless
+    const confirmResponse = await goCardless.redirectFlows.complete(redirectFlowId, {
+      params: { session_token: sessionToken }
     });
 
-    const customerId = completed.links.customer;
-    const { customer } = await goCardless.customers.find(customerId);
+    const customerId = confirmResponse.redirect_flows.links.customer;
+    const mandateId = confirmResponse.redirect_flows.links.mandate;
 
-    if (!customer) {
-      return res.status(500).json({ error: 'Client GoCardless introuvable.' });
+    // 2. Récupérer le nom du client stocké temporairement
+    const opticien = sessionTokenMap[sessionToken]; // doit contenir nom, adresse, etc.
+
+    if (!opticien) {
+      return res.status(400).send('Données opticien manquantes.');
     }
 
-    // 🔑 Génération de la licence
+    // 3. Générer une licence unique
     const licenceKey = uuidv4();
-
-    const licencesPath = path.join(__dirname, 'public', 'licences.json');
-    let licences = [];
-
-    if (fs.existsSync(licencesPath)) {
-      const content = fs.readFileSync(licencesPath, 'utf8');
-      licences = JSON.parse(content).licences || [];
-    }
-
     const newLicence = {
-      id: licenceKey,
-      cle: licenceKey,
+      id: uuidv4(),
+      licence: licenceKey,
+      dateCreation: new Date().toISOString(),
+      abonnement: "Pro",
+      credits: 100,
       opticien: {
-        nom: customer.family_name || '',
-        prenom: customer.given_name || '',
-        email: customer.email || '',
+        nom: opticien.nom,
+        adresse: opticien.adresse,
+        telephone: opticien.telephone,
+        email: opticien.email,
+        siret: opticien.siret
       },
-      formule: 'pro',
-      credits: 300,
-      renouvellement: 'mensuel',
-      historique: [
-        {
-          date: new Date().toISOString(),
-          type: 'activation',
-          credits: 300,
-        },
-      ],
-      factures: [],
+      mandateId,
+      customerId
     };
 
+    // 4. Enregistrer dans licences.json
+    const licencesPath = path.join(__dirname, 'public', 'licences.json');
+    const licences = JSON.parse(fs.readFileSync(licencesPath, 'utf8'));
     licences.push(newLicence);
-    fs.writeFileSync(licencesPath, JSON.stringify({ licences }, null, 2), 'utf8');
+    fs.writeFileSync(licencesPath, JSON.stringify(licences, null, 2));
 
-    console.log('✅ Licence créée pour :', customer.email);
-
-    // ✅ Redirection vers l’application mobile avec la licence
-    return res.redirect(`opticom://MandateValidationPage?licence=${licenceKey}`);
-
-
+    // 5. Réponse HTML affichant la clé de licence
+    res.send(`
+      <html>
+        <head>
+          <title>Licence validée</title>
+          <style>
+            body { font-family: sans-serif; padding: 30px; background: #f7f7f7; }
+            .box { background: white; border-radius: 10px; padding: 20px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+            h1 { color: #2e7d32; }
+            code { background: #eee; padding: 5px 10px; font-size: 1.2em; border-radius: 5px; }
+          </style>
+        </head>
+        <body>
+          <div class="box">
+            <h1>🎉 Votre mandat est validé !</h1>
+            <p>Voici votre clé de licence :</p>
+            <p><code>${licenceKey}</code></p>
+            <p>Vous pouvez maintenant retourner dans l'application OptiCOM et la saisir dans l'onglet <strong>“J'ai déjà une licence”</strong>.</p>
+          </div>
+        </body>
+      </html>
+    `);
   } catch (error) {
-    console.error('❌ Erreur /validation-mandat :', error);
-    return res.status(500).json({ error: 'Erreur lors de la validation du mandat.' });
+    console.error(error);
+    res.status(500).send("Erreur lors de la validation du mandat.");
   }
 });
+
 
 
 
