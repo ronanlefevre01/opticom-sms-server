@@ -13,7 +13,7 @@ const goCardless = require('gocardless-nodejs');
 const sessionTokenMap = new Map();
 const goCardlessClient = goCardless(
   process.env.GOCARDLESS_API_KEY,
-  process.env.GOCARDLESS_ENV || 'sandbox'
+  process.env.GOCARDLESS_ENV || 'live'
 );
 
 
@@ -29,7 +29,7 @@ const PORT = process.env.PORT || 3001;
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 // Configuration GoCardless Sandbox (ou live si tu changes l'URL)
-const GO_CARDLESS_API_BASE = 'https://api-sandbox.gocardless.com';
+const GO_CARDLESS_API_BASE = 'https://api.gocardless.com';
 
 // === Fonctions utilitaires pour charger / enregistrer les licences ===
 const pathLic = path.join(__dirname, 'licences.json');
