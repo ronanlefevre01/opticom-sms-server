@@ -122,7 +122,7 @@ app.get('/', (req, res) => {
 app.post('/create-mandat', async (req, res) => {
   const {
     nom, prenom, email, adresse, ville,
-    codePostal, pays, formule, siret, telephone
+    codePostal, pays, formuleId, siret, telephone
   } = req.body;
 
   try {
@@ -152,7 +152,7 @@ app.post('/create-mandat', async (req, res) => {
           session_token,
           success_redirect_url: `https://opticom-sms-server.onrender.com/validation-mandat?session_token=${session_token}`,
           prefilled_customer: customerData,
-          metadata: { formule, siret, telephone }
+          metadata: { formuleId, siret, telephone }
         }
       })
     });
@@ -169,7 +169,7 @@ app.post('/create-mandat', async (req, res) => {
     // 🧠 Stocke temporairement les infos opticien associées au session_token
     sessionTokenMap.set(session_token, {
       nom, prenom, email, adresse, ville,
-      codePostal, pays, formule, siret, telephone
+      codePostal, pays, formuleId, siret, telephone
     });
 
     // 🔁 Redirige vers GoCardless pour signature
