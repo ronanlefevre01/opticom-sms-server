@@ -215,7 +215,8 @@ app.get('/validation-mandat', async (req, res) => {
     }
 
     // 🔸 Trouver la formule choisie (grâce au tableau global `formulas`)
-    const selectedFormule = formulas.find(f => f.id === opticien.formule) || { name: "Formule inconnue", credits: 0 };
+    const selectedFormule = formulas.find(f => f.id === opticien.formuleId) || { name: "Formule inconnue", credits: 0 };
+
     const abonnement = selectedFormule.name;
     const credits = selectedFormule.credits;
 
