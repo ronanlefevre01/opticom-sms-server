@@ -174,7 +174,7 @@ app.post('/create-mandat', async (req, res) => {
 
     // 🔁 Redirige vers GoCardless pour signature
     const redirectUrl = redirectFlow.redirect_url;
-    res.status(200).json({ redirectUrl: redirectUrl });
+    res.status(200).json({ url: redirectUrl });
 
   } catch (err) {
     console.error('❗ Exception GoCardless:', err);
