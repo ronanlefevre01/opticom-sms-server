@@ -306,53 +306,64 @@ app.post('/send-sms', async (req, res) => {
     return res.status(400).json({ success: false, error: 'Champs manquants.' });
   }
 
-  const licences = fs.existsSync('./licences.json') ? JSON.parse(fs.readFileSync('./licences.json', 'utf-8')) : [];
-  const licence = licences.find(l => l.cleLicence === licenceKey);
-
-  if (!licence) {
-    return res.status(403).json({ success: false, error: 'Licence invalide.' });
-  }
-
-  if (licence.opticien.formule !== 'Illimitée' && licence.credits < 1) {
-    return res.status(403).json({ success: false, error: 'Crédits insuffisants.' });
-  }
-
-  const formattedNumber = phoneNumber.replace(/^0/, '+33');
-  const params = new URLSearchParams();
-  params.append('accessToken', process.env.SMSMODE_API_KEY);
-  params.append('message', message);
-  params.append('numero', formattedNumber);
-  params.append('emetteur', emetteur || 'Opticien');
-  params.append('utf8', '1');
-  params.append('charset', 'UTF-8');
-
   try {
-    const response = await fetch('https://api.smsmode.com/http/1.6/sendSMS.do', {
+    // 1. 🔁 Charger les licences depuis JSONBin.io
+    const responseBin = await fetch('https://api.jsonbin.io/v3/b/6896145eae596e708fc53dde/latest', {
+      headers: { 'X-Master-Key': process.env.JSONBIN_API_KEY },
+    });
+
+    if (!responseBin.ok) {
+      throw new Error('Erreur de lecture JSONBin');
+    }
+
+    const binData = await responseBin.json();
+    const licences = binData.record.licences; // ⚠️ Assure-toi que ton JSON contient bien "licences": [...]
+
+    // 2. 🔍 Trouver la licence correspondante
+    const licence = licences.find(l => l.licence === licenceKey);
+
+    if (!licence) {
+      return res.status(403).json({ success: false, error: 'Licence introuvable dans JSONBin.' });
+    }
+
+    if (licence.abonnement !== 'Illimitée' && licence.credits < 1) {
+      return res.status(403).json({ success: false, error: 'Crédits insuffisants.' });
+    }
+
+    // 3. 📱 Préparer le SMS
+    const formattedNumber = phoneNumber.replace(/^0/, '+33');
+    const params = new URLSearchParams();
+    params.append('accessToken', process.env.SMSMODE_API_KEY);
+    params.append('message', message);
+    params.append('numero', formattedNumber);
+    params.append('emetteur', emetteur || 'Opticien');
+    params.append('utf8', '1');
+    params.append('charset', 'UTF-8');
+
+    // 4. 📤 Envoyer le SMS
+    const smsResponse = await fetch('https://api.smsmode.com/http/1.6/sendSMS.do', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-      },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
       body: params.toString(),
     });
 
-    const text = await response.text();
-    console.log('📨 Réponse SMSMode :', text);
+    const smsText = await smsResponse.text();
+    console.log('📨 Réponse SMSMode :', smsText);
 
-    if (response.ok && !text.includes('error')) {
-      if (licence.opticien.formule !== 'Illimitée') {
-        licence.credits -= 1;
-        fs.writeFileSync('./licences.json', JSON.stringify(licences, null, 2));
-      }
+    if (smsResponse.ok && !smsText.includes('error')) {
+      // 👇 Ici on n'enregistre pas la décrémentation, car JSONBin ne permet pas l’écriture depuis le front sans sécurité supplémentaire
 
       return res.json({ success: true });
     } else {
-      return res.status(500).json({ success: false, error: text });
+      return res.status(500).json({ success: false, error: smsText });
     }
+
   } catch (err) {
-    console.error('❗ Erreur réseau SMSMode:', err);
-    res.status(500).json({ success: false, error: 'Erreur réseau.' });
+    console.error('❗ Erreur JSONBin ou SMSMode:', err);
+    res.status(500).json({ success: false, error: err.message });
   }
 });
+
 
 // === Achat de crédits via GoCardless (clients abonnés) ===
 app.post('/achat-credits-gocardless', async (req, res) => {
