@@ -298,7 +298,6 @@ app.get('/validation-mandat', async (req, res) => {
 });
 
 
-
 app.post('/send-sms', async (req, res) => {
   const { phoneNumber, message, emetteur, licenceKey } = req.body;
 
@@ -306,13 +305,13 @@ app.post('/send-sms', async (req, res) => {
     return res.status(400).json({ success: false, error: 'Champs manquants.' });
   }
 
-  if (!process.env.JSONBIN_API_KEY) {
-    return res.status(500).json({ success: false, error: 'Clé API JSONBin manquante dans .env.' });
+  if (!process.env.JSONBIN_API_KEY || !process.env.JSONBIN_BIN_ID) {
+    return res.status(500).json({ success: false, error: 'Clé API JSONBin ou ID du bin manquant.' });
   }
 
   try {
-    // 1. 🔁 Charger les licences depuis JSONBin.io
-    const responseBin = await fetch('https://api.jsonbin.io/v3/b/6896145eae596e708fc53dde/latest', {
+    // 1. 🔁 Charger les licences depuis JSONBin
+    const responseBin = await fetch(`https://api.jsonbin.io/v3/b/${process.env.JSONBIN_BIN_ID}/latest`, {
       headers: {
         'X-Master-Key': process.env.JSONBIN_API_KEY,
       },
@@ -323,23 +322,24 @@ app.post('/send-sms', async (req, res) => {
     }
 
     const binData = await responseBin.json();
-    const licences = binData.record; // car ton JSON est un tableau directement
+    const licences = binData.record;
 
-    console.log('✅ Licences chargées :', licences.length);
-    console.log('🔍 Licence recherchée :', licenceKey);
-
-    // 2. 🔍 Trouver la licence correspondante
-    const licence = licences.find(l => l.licence === licenceKey);
-
-    if (!licence) {
+    const licenceIndex = licences.findIndex(l => l.licence === licenceKey);
+    if (licenceIndex === -1) {
       return res.status(403).json({ success: false, error: 'Licence introuvable dans JSONBin.' });
+    }
+
+    const licence = licences[licenceIndex];
+
+    if (!licence.id) {
+      return res.status(500).json({ success: false, error: 'Identifiant opticien manquant dans la licence.' });
     }
 
     if (licence.abonnement !== 'Illimitée' && licence.credits < 1) {
       return res.status(403).json({ success: false, error: 'Crédits insuffisants.' });
     }
 
-    // 3. 📱 Préparer le SMS
+    // 2. 📤 Préparer l’envoi SMS
     const formattedNumber = phoneNumber.replace(/^0/, '+33');
     const params = new URLSearchParams();
     params.append('accessToken', process.env.SMSMODE_API_KEY);
@@ -349,7 +349,7 @@ app.post('/send-sms', async (req, res) => {
     params.append('utf8', '1');
     params.append('charset', 'UTF-8');
 
-    // 4. 📤 Envoyer le SMS
+    // 3. 🚀 Envoi du SMS
     const smsResponse = await fetch('https://api.smsmode.com/http/1.6/sendSMS.do', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
@@ -360,14 +360,39 @@ app.post('/send-sms', async (req, res) => {
     console.log('📨 Réponse SMSMode :', smsText);
 
     if (smsResponse.ok && !smsText.includes('error')) {
-      return res.json({ success: true });
+      // 4. ✅ Décrémenter les crédits
+      if (licence.abonnement !== 'Illimitée') {
+        licence.credits = Math.max(0, licence.credits - 1);
+        licences[licenceIndex] = licence;
+
+        // 5. 🔄 Mettre à jour le bin complet dans JSONBin
+        const updateResponse = await fetch(`https://api.jsonbin.io/v3/b/${process.env.JSONBIN_BIN_ID}`, {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Master-Key': process.env.JSONBIN_API_KEY,
+          },
+          body: JSON.stringify(licences),
+        });
+
+        if (!updateResponse.ok) {
+          throw new Error('Erreur de mise à jour JSONBin');
+        }
+      }
+
+      return res.json({
+        success: true,
+        opticienId: licence.id,
+        credits: licence.credits,
+        abonnement: licence.abonnement,
+      });
     } else {
       return res.status(500).json({ success: false, error: smsText });
     }
 
   } catch (err) {
     console.error('❗ Erreur JSONBin ou SMSMode:', err);
-    res.status(500).json({ success: false, error: err.message });
+    return res.status(500).json({ success: false, error: err.message });
   }
 });
 
