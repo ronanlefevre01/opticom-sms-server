@@ -306,10 +306,16 @@ app.post('/send-sms', async (req, res) => {
     return res.status(400).json({ success: false, error: 'Champs manquants.' });
   }
 
+  if (!process.env.JSONBIN_API_KEY) {
+    return res.status(500).json({ success: false, error: 'Clé API JSONBin manquante dans .env.' });
+  }
+
   try {
     // 1. 🔁 Charger les licences depuis JSONBin.io
     const responseBin = await fetch('https://api.jsonbin.io/v3/b/6896145eae596e708fc53dde/latest', {
-      headers: { 'X-Master-Key': process.env.JSONBIN_API_KEY },
+      headers: {
+        'X-Master-Key': process.env.JSONBIN_API_KEY,
+      },
     });
 
     if (!responseBin.ok) {
@@ -317,7 +323,10 @@ app.post('/send-sms', async (req, res) => {
     }
 
     const binData = await responseBin.json();
-    const licences = binData.record.licences; // ⚠️ Assure-toi que ton JSON contient bien "licences": [...]
+    const licences = binData.record; // car ton JSON est un tableau directement
+
+    console.log('✅ Licences chargées :', licences.length);
+    console.log('🔍 Licence recherchée :', licenceKey);
 
     // 2. 🔍 Trouver la licence correspondante
     const licence = licences.find(l => l.licence === licenceKey);
@@ -351,8 +360,6 @@ app.post('/send-sms', async (req, res) => {
     console.log('📨 Réponse SMSMode :', smsText);
 
     if (smsResponse.ok && !smsText.includes('error')) {
-      // 👇 Ici on n'enregistre pas la décrémentation, car JSONBin ne permet pas l’écriture depuis le front sans sécurité supplémentaire
-
       return res.json({ success: true });
     } else {
       return res.status(500).json({ success: false, error: smsText });
