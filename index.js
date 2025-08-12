@@ -328,7 +328,7 @@ app.post('/send-sms', async (req, res) => {
     return res.status(500).json({ success: false, error: 'SMSMODE_LOGIN / SMSMODE_PASSWORD manquants.' });
   }
 
-  // Normalise l’émetteur (3–11 alphanum)
+  // Normalise émetteur (3–11 alphanum)
   const normalizeSender = (s = '') => {
     let x = String(s).replace(/[^a-zA-Z0-9]/g, '');
     if (x.length > 11) x = x.slice(0, 11);
@@ -338,25 +338,20 @@ app.post('/send-sms', async (req, res) => {
   const sender = normalizeSender(emetteur);
 
   // Normalise numéro (FR)
-  const toFR = (raw = '') => raw.replace(/[^\d+]/g, '').replace(/^0/, '+33');
+  const toFR = (raw = '') => String(raw).replace(/[^\d+]/g, '').replace(/^0/, '+33');
 
   try {
-    // 1) Charger les licences depuis JSONBin
-    const rBin = await fetch(
-      `https://api.jsonbin.io/v3/b/${process.env.JSONBIN_BIN_ID}/latest`,
-      {
-        headers: {
-          ...(process.env.JSONBIN_API_KEY ? { 'X-Master-Key': process.env.JSONBIN_API_KEY } : {}),
-          'X-Bin-Meta': 'false',
-        },
-      }
-    );
-
+    // 1) Lire licences depuis JSONBin
+    const rBin = await fetch(`https://api.jsonbin.io/v3/b/${process.env.JSONBIN_BIN_ID}/latest`, {
+      headers: {
+        ...(process.env.JSONBIN_API_KEY ? { 'X-Master-Key': process.env.JSONBIN_API_KEY } : {}),
+        'X-Bin-Meta': 'false',
+      },
+    });
     if (!rBin.ok) {
       const body = await rBin.text().catch(() => '');
       throw new Error(`Erreur JSONBin (${rBin.status}): ${body}`);
     }
-
     const bin = await rBin.json();
     const record = bin?.record ?? bin;
     const list = Array.isArray(record) ? record : [record];
@@ -376,22 +371,18 @@ app.post('/send-sms', async (req, res) => {
       }
     }
 
-    // 4) Appel SMSMode (pseudo + mot de passe) en **Unicode UCS-2**
+    // 4) Appel SMSMode (pseudo + mot de passe) — message UTF-8 + unicode=1 (emojis OK)
     const numero = toFR(phoneNumber);
-
-    // IMPORTANT: en unicode=1, 'message' doit être en UCS-2 BE hex
-    const msgHex = toUCS2Hex(message);
 
     const params = new URLSearchParams();
     params.append('pseudo', process.env.SMSMODE_LOGIN);
     params.append('pass', process.env.SMSMODE_PASSWORD);
-    params.append('message', msgHex);   // <-- UCS-2 hex
-    params.append('coding', '2');      // <-- indique l’Unicode
-    params.append('smslong', '1');      // optionnel: concaténation si >70 chars
+    params.append('message', message);          // ← en clair (UTF-8)
+    params.append('unicode', '1');              // ← active l’Unicode / emojis
+    params.append('smslong', '1');              // optionnel: concaténation si > 70 caractères
     params.append('numero', numero);
     params.append('emetteur', sender);
-
-    // ⚠️ ne PAS mettre utf8/charset/coding ici (ça casse les emojis)
+    // ⚠️ NE PAS ajouter coding/charset/utf8 avec unicode=1
 
     const smsResp = await fetch('https://api.smsmode.com/http/1.6/sendSMS.do', {
       method: 'POST',
@@ -403,22 +394,17 @@ app.post('/send-sms', async (req, res) => {
     console.log('SMSMode status:', smsResp.status);
     console.log('SMSMode body  :', smsText);
 
-    // Gestion erreurs connues HTTP 1.6 :
-    // 32 = auth KO ; 35 = paramètres manquants ; "error" (générique)
+    // 32 = auth KO ; 35 = params manquants ; "error" générique
     const smsHasError =
-      !smsResp.ok ||
-      /^32\s*\|/i.test(smsText) ||
-      /^35\s*\|/i.test(smsText) ||
-      /\berror\b/i.test(smsText);
+      !smsResp.ok || /^32\s*\|/i.test(smsText) || /^35\s*\|/i.test(smsText) || /\berror\b/i.test(smsText);
 
     if (smsHasError) {
       return res.status(502).json({ success: false, error: `Erreur SMSMode: ${smsText}` });
     }
 
-    // 5) Décrémenter crédits dans JSONBin (si non illimitée)
+    // 5) Décrémenter crédits (si non illimitée)
     if (licence.abonnement !== 'Illimitée') {
       licence.credits = Math.max(0, Number(licence.credits || 0) - 1);
-
       const bodyToPut = Array.isArray(record) ? (list[idx] = licence, list) : licence;
 
       const upd = await fetch(`https://api.jsonbin.io/v3/b/${process.env.JSONBIN_BIN_ID}`, {
@@ -429,7 +415,6 @@ app.post('/send-sms', async (req, res) => {
         },
         body: JSON.stringify(bodyToPut),
       });
-
       if (!upd.ok) {
         const t = await upd.text().catch(() => '');
         throw new Error(`Erreur mise à jour JSONBin: ${t}`);
@@ -443,7 +428,6 @@ app.post('/send-sms', async (req, res) => {
       credits: licence.credits,
       abonnement: licence.abonnement,
     });
-
   } catch (err) {
     console.error('Erreur /send-sms:', err);
     return res.status(500).json({ success: false, error: String(err.message || err) });
