@@ -298,15 +298,21 @@ app.get('/validation-mandat', async (req, res) => {
 });
 
 
+// Route: envoi SMS avec auth SMSMode par pseudo/mot de passe (HTTP 1.6)
 app.post('/send-sms', async (req, res) => {
   const { phoneNumber, message, emetteur, licenceId } = req.body;
 
+  // Champs requis
   if (!phoneNumber || !message || !emetteur || !licenceId) {
     return res.status(400).json({ success: false, error: 'Champs manquants.' });
   }
 
+  // ENV requis
   if (!process.env.JSONBIN_BIN_ID) {
     return res.status(500).json({ success: false, error: 'JSONBIN_BIN_ID manquant.' });
+  }
+  if (!process.env.SMSMODE_LOGIN || !process.env.SMSMODE_PASSWORD) {
+    return res.status(500).json({ success: false, error: 'SMSMODE_LOGIN / SMSMODE_PASSWORD manquants.' });
   }
 
   // Normalise l’émetteur (3–11 alphanum)
@@ -318,8 +324,11 @@ app.post('/send-sms', async (req, res) => {
   };
   const sender = normalizeSender(emetteur);
 
+  // Normalise numéro (FR)
+  const toFR = (raw = '') => raw.replace(/[^\d+]/g, '').replace(/^0/, '+33');
+
   try {
-    // 1) Charger licences depuis JSONBin
+    // 1) Charger les licences depuis JSONBin
     const rBin = await fetch(
       `https://api.jsonbin.io/v3/b/${process.env.JSONBIN_BIN_ID}/latest`,
       {
@@ -329,22 +338,24 @@ app.post('/send-sms', async (req, res) => {
         },
       }
     );
+
     if (!rBin.ok) {
       const body = await rBin.text().catch(() => '');
       throw new Error(`Erreur JSONBin (${rBin.status}): ${body}`);
     }
+
     const bin = await rBin.json();
     const record = bin?.record ?? bin;
     const list = Array.isArray(record) ? record : [record];
 
-    // 2) Cherche la licence par ID
+    // 2) Chercher la licence par ID
     const idx = list.findIndex((lic) => String(lic.id) === String(licenceId));
     if (idx === -1) {
       return res.status(403).json({ success: false, error: 'Licence introuvable pour cet ID.' });
     }
     const licence = list[idx];
 
-    // 3) Vérif crédits
+    // 3) Vérifier crédits (si non illimitée)
     if (licence.abonnement !== 'Illimitée') {
       const credits = Number(licence.credits || 0);
       if (!Number.isFinite(credits) || credits < 1) {
@@ -352,35 +363,20 @@ app.post('/send-sms', async (req, res) => {
       }
     }
 
-    // 4) Appel SMSMode
-    const numero = phoneNumber.replace(/^0/, '+33'); // FR
+    // 4) Appel SMSMode (pseudo + mot de passe)
+    const numero = toFR(phoneNumber);
     const params = new URLSearchParams();
+    params.append('pseudo', process.env.SMSMODE_LOGIN);
+    params.append('pass', process.env.SMSMODE_PASSWORD);
     params.append('message', message);
     params.append('numero', numero);
     params.append('emetteur', sender);
     params.append('utf8', '1');
     params.append('charset', 'UTF-8');
 
-    const useBearer = (process.env.SMSMODE_AUTH || 'bearer').toLowerCase() === 'bearer';
-    const headers = { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' };
-
-    if (useBearer) {
-      // Auth moderne
-      if (!process.env.SMSMODE_API_KEY) {
-        return res.status(500).json({ success: false, error: 'SMSMODE_API_KEY manquant.' });
-      }
-      headers['Authorization'] = `Bearer ${process.env.SMSMODE_API_KEY}`;
-    } else {
-      // Auth legacy par token (paramètre accessToken)
-      if (!process.env.SMSMODE_API_KEY) {
-        return res.status(500).json({ success: false, error: 'SMSMODE_API_KEY manquant.' });
-      }
-      params.append('accessToken', process.env.SMSMODE_API_KEY);
-    }
-
     const smsResp = await fetch('https://api.smsmode.com/http/1.6/sendSMS.do', {
       method: 'POST',
-      headers,
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
       body: params.toString(),
     });
 
@@ -388,17 +384,23 @@ app.post('/send-sms', async (req, res) => {
     console.log('SMSMode status:', smsResp.status);
     console.log('SMSMode body  :', smsText);
 
-    // Cas d’erreur côté SMSMode
-    if (!smsResp.ok || /(^|\|)\s*error/i.test(smsText) || smsText.startsWith('32 |')) {
-      const hint = smsText.startsWith('32 |') && useBearer
-        ? ' (vérifie que la clé API est bien un Bearer valide sur HTTP 1.6)'
-        : '';
-      return res.status(502).json({ success: false, error: `Erreur SMSMode: ${smsText}${hint}` });
+    // Gestion erreurs connues HTTP 1.6 :
+    // 32 = auth KO ; 35 = paramètres manquants ; "error" (générique)
+    const smsHasError =
+      !smsResp.ok ||
+      /^32\s*\|/i.test(smsText) ||
+      /^35\s*\|/i.test(smsText) ||
+      /\berror\b/i.test(smsText);
+
+    if (smsHasError) {
+      return res.status(502).json({ success: false, error: `Erreur SMSMode: ${smsText}` });
     }
 
-    // 5) Décrémenter crédits (si pas illimité)
+    // 5) Décrémenter crédits dans JSONBin (si non illimitée)
     if (licence.abonnement !== 'Illimitée') {
       licence.credits = Math.max(0, Number(licence.credits || 0) - 1);
+
+      // reconstruire la payload PUT (array vs objet)
       const bodyToPut = Array.isArray(record) ? (list[idx] = licence, list) : licence;
 
       const upd = await fetch(`https://api.jsonbin.io/v3/b/${process.env.JSONBIN_BIN_ID}`, {
@@ -409,24 +411,26 @@ app.post('/send-sms', async (req, res) => {
         },
         body: JSON.stringify(bodyToPut),
       });
+
       if (!upd.ok) {
         const t = await upd.text().catch(() => '');
         throw new Error(`Erreur mise à jour JSONBin: ${t}`);
       }
     }
 
+    // 6) OK
     return res.json({
       success: true,
       opticienId: licence.id,
       credits: licence.credits,
       abonnement: licence.abonnement,
     });
+
   } catch (err) {
     console.error('Erreur /send-sms:', err);
     return res.status(500).json({ success: false, error: String(err.message || err) });
   }
 });
-
 
 
 // === Achat de crédits via GoCardless (clients abonnés) ===
