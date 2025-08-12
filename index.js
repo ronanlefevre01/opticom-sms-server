@@ -299,71 +299,96 @@ app.get('/validation-mandat', async (req, res) => {
 
 
 app.post('/send-sms', async (req, res) => {
-  const { phoneNumber, message, emetteur } = req.body;
+  const { phoneNumber, message, emetteur, licenceId } = req.body;
 
-  // 1) Champs requis (sans licenceKey)
-  if (!phoneNumber || !message || !emetteur) {
+  // Champs requis
+  if (!phoneNumber || !message || !emetteur || !licenceId) {
     return res.status(400).json({ success: false, error: 'Champs manquants.' });
   }
 
+  // Env requis
   if (!process.env.JSONBIN_API_KEY || !process.env.JSONBIN_BIN_ID) {
-    return res.status(500).json({ success: false, error: 'Clé API JSONBin ou ID du bin manquant.' });
+    return res.status(500).json({
+      success: false,
+      error: 'Clé API JSONBin ou ID du bin manquant.',
+    });
+  }
+  if (!process.env.SMSMODE_API_KEY) {
+    return res.status(500).json({
+      success: false,
+      error: 'Clé API SMSMode manquante.',
+    });
   }
 
-  // Normalisation émetteur (même règle que l’app)
+  // Normalisation émetteur (accents off, alphanum, UPPER, 3..11)
   const normalizeSender = (s = '') => {
-    let x = String(s).replace(/[^a-zA-Z0-9]/g, '');
+    let x = String(s)
+      .normalize('NFKD')
+      .replace(/[\u0300-\u036f]/g, '') // accents
+      .replace(/[^a-zA-Z0-9]/g, '')
+      .toUpperCase();
     if (x.length > 11) x = x.slice(0, 11);
-    if (x.length < 3) x = 'OptiCOM';
+    if (x.length < 3) x = 'OPTICOM';
     return x;
   };
   const reqSender = normalizeSender(emetteur);
 
+  // Format FR -> international
+  const toIntlFR = (n) => {
+    const raw = String(n).trim();
+    if (raw.startsWith('+')) return raw;           // déjà international
+    return raw.replace(/^0/, '+33');               // 0XXXXXXXXX -> +33XXXXXXXXX
+  };
+
   try {
-    // 2) Lire JSONBin (licence(s))
+    // 1) Lire licences depuis JSONBin
     const responseBin = await fetch(
       `https://api.jsonbin.io/v3/b/${process.env.JSONBIN_BIN_ID}/latest`,
       { headers: { 'X-Master-Key': process.env.JSONBIN_API_KEY, 'X-Bin-Meta': 'false' } }
     );
     if (!responseBin.ok) {
       const t = await responseBin.text().catch(() => '');
-      throw new Error(`Erreur JSONBin (${responseBin.status}): ${t}`);
+      throw new Error(`Erreur de lecture JSONBin (${responseBin.status}): ${t}`);
     }
 
     const binJson = await responseBin.json();
     const record = binJson?.record ?? binJson;
-
-    // Supporte bin = array OU objet
     const licences = Array.isArray(record) ? record : [record];
 
-    // 3) Trouver la licence par émetteur (libelleExpediteur -> opticien.nom -> nom)
-    const findSenderForLic = (lic) =>
-      normalizeSender(lic?.libelleExpediteur || lic?.opticien?.nom || lic?.nom || '');
+    // 2) Trouver licence par ID stable (lic.id ou lic.opticien.id)
+    const wantedId = String(licenceId).trim();
+    const getId = (lic) =>
+      String(lic?.id || lic?.opticien?.id || '').trim();
 
-    const idx = licences.findIndex((lic) => findSenderForLic(lic) === reqSender);
+    const idx = licences.findIndex((lic) => getId(lic) === wantedId);
     if (idx === -1) {
-      return res.status(403).json({ success: false, error: 'Licence introuvable pour cet émetteur.' });
+      return res.status(403).json({ success: false, error: 'Licence introuvable pour cet ID.' });
     }
 
     const licence = licences[idx];
 
-    if (!licence?.id) {
-      return res.status(500).json({ success: false, error: 'Identifiant opticien manquant dans la licence.' });
-    }
-
-    if (licence.abonnement !== 'Illimitée' && (!Number.isFinite(licence.credits) || licence.credits < 1)) {
+    // 3) Vérif crédits
+    const abonnement = String(licence?.abonnement || '').trim();
+    const creditsNum = Number(licence?.credits ?? 0);
+    if (abonnement !== 'Illimitée' && (!Number.isFinite(creditsNum) || creditsNum < 1)) {
       return res.status(403).json({ success: false, error: 'Crédits insuffisants.' });
     }
 
-    // 4) Envoi SMS
-    const formattedNumber = phoneNumber.replace(/^0/, '+33');
+    // 4) Envoi SMS via SMSMode
+    const formattedNumber = toIntlFR(phoneNumber);
     const params = new URLSearchParams();
     params.append('accessToken', process.env.SMSMODE_API_KEY);
-    params.append('message', message);
+    params.append('message', String(message));
     params.append('numero', formattedNumber);
     params.append('emetteur', reqSender);
     params.append('utf8', '1');
     params.append('charset', 'UTF-8');
+
+    console.log('📤 Envoi SMS ->', {
+      numero: formattedNumber,
+      emetteur: reqSender,
+      licenceId: wantedId,
+    });
 
     const smsResponse = await fetch('https://api.smsmode.com/http/1.6/sendSMS.do', {
       method: 'POST',
@@ -372,20 +397,28 @@ app.post('/send-sms', async (req, res) => {
     });
 
     const smsText = await smsResponse.text();
-    console.log('📨 Réponse SMSMode :', smsText);
+    console.log('📨 SMSMode status:', smsResponse.status);
+    console.log('📨 SMSMode body  :', smsText);
 
-    if (!smsResponse.ok || smsText.includes('error')) {
-      return res.status(500).json({ success: false, error: smsText || 'Erreur SMSMode' });
+    if (!smsResponse.ok || /error/i.test(smsText)) {
+      return res.status(502).json({
+        success: false,
+        error: 'SMSMode a renvoyé une erreur',
+        details: { status: smsResponse.status, body: smsText },
+      });
     }
 
     // 5) Décrément crédits si nécessaire + update JSONBin
-    if (licence.abonnement !== 'Illimitée') {
-      licence.credits = Math.max(0, Number(licence.credits || 0) - 1);
-
-      // reconstruire le record à PUT (array vs objet)
-      const bodyToPut = Array.isArray(record)
-        ? (licences[idx] = licence, licences)
-        : licence;
+    if (abonnement !== 'Illimitée') {
+      const newCredits = Math.max(0, creditsNum - 1);
+      // met à jour l’objet en mémoire
+      if (Array.isArray(record)) {
+        licences[idx] = { ...licence, credits: newCredits };
+      } else {
+        // record objet simple
+        licences[0] = { ...licence, credits: newCredits };
+      }
+      const bodyToPut = Array.isArray(record) ? licences : licences[0];
 
       const updateResponse = await fetch(`https://api.jsonbin.io/v3/b/${process.env.JSONBIN_BIN_ID}`, {
         method: 'PUT',
@@ -405,9 +438,9 @@ app.post('/send-sms', async (req, res) => {
     // 6) OK
     return res.json({
       success: true,
-      opticienId: licence.id,
-      credits: licence.credits,
-      abonnement: licence.abonnement,
+      opticienId: getId(licence),
+      credits: abonnement === 'Illimitée' ? licence.credits : Math.max(0, creditsNum - 1),
+      abonnement,
     });
 
   } catch (err) {
@@ -415,6 +448,7 @@ app.post('/send-sms', async (req, res) => {
     return res.status(500).json({ success: false, error: err.message });
   }
 });
+
 
 
 
