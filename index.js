@@ -386,7 +386,7 @@ app.post('/send-sms', async (req, res) => {
     params.append('pseudo', process.env.SMSMODE_LOGIN);
     params.append('pass', process.env.SMSMODE_PASSWORD);
     params.append('message', msgHex);   // <-- UCS-2 hex
-    params.append('unicode', '1');      // <-- indique l’Unicode
+    params.append('coding', '2');      // <-- indique l’Unicode
     params.append('smslong', '1');      // optionnel: concaténation si >70 chars
     params.append('numero', numero);
     params.append('emetteur', sender);
