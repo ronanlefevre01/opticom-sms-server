@@ -315,9 +315,12 @@ const toUCS2Hex = (str) => {
 app.post('/send-sms', async (req, res) => {
   const { phoneNumber, message, emetteur, licenceId } = req.body;
 
+  // Champs requis
   if (!phoneNumber || !message || !emetteur || !licenceId) {
     return res.status(400).json({ success: false, error: 'Champs manquants.' });
   }
+
+  // ENV requis
   if (!process.env.JSONBIN_BIN_ID) {
     return res.status(500).json({ success: false, error: 'JSONBIN_BIN_ID manquant.' });
   }
@@ -325,6 +328,7 @@ app.post('/send-sms', async (req, res) => {
     return res.status(500).json({ success: false, error: 'SMSMODE_LOGIN / SMSMODE_PASSWORD manquants.' });
   }
 
+  // Normalise émetteur (3–11 alphanum)
   const normalizeSender = (s = '') => {
     let x = String(s).replace(/[^a-zA-Z0-9]/g, '');
     if (x.length > 11) x = x.slice(0, 11);
@@ -333,25 +337,11 @@ app.post('/send-sms', async (req, res) => {
   };
   const sender = normalizeSender(emetteur);
 
-  const toFR = (raw = '') => raw.replace(/[^\d+]/g, '').replace(/^0/, '+33');
-
-  // Caractères GSM 7-bit (de base + extension) — si on sort de là, on passera en UCS-2
-  const GSM_BASIC = /^[\x0A\x0D\x20-\x7E€£¥èéùìòÇØøÅåÄÖÑÜäöñüÆæßÉ]+$/; // tolérant, pas parfait
-  const needsUnicode = !GSM_BASIC.test(message);
-
-  // UTF-16LE -> swap -> HEX (UCS-2 BE HEX)
-  const toUCS2BEHex = (str) => {
-    const bufLE = Buffer.from(str, 'utf16le');
-    for (let i = 0; i < bufLE.length; i += 2) {
-      const a = bufLE[i];
-      bufLE[i] = bufLE[i + 1];
-      bufLE[i + 1] = a;
-    }
-    return bufLE.toString('hex').toUpperCase();
-  };
+  // Normalise numéro (FR)
+  const toFR = (raw = '') => String(raw).replace(/[^\d+]/g, '').replace(/^0/, '+33');
 
   try {
-    // 1) Lire les licences
+    // 1) Lire licences depuis JSONBin
     const rBin = await fetch(`https://api.jsonbin.io/v3/b/${process.env.JSONBIN_BIN_ID}/latest`, {
       headers: {
         ...(process.env.JSONBIN_API_KEY ? { 'X-Master-Key': process.env.JSONBIN_API_KEY } : {}),
@@ -366,14 +356,14 @@ app.post('/send-sms', async (req, res) => {
     const record = bin?.record ?? bin;
     const list = Array.isArray(record) ? record : [record];
 
-    // 2) Licence
+    // 2) Chercher la licence par ID
     const idx = list.findIndex((lic) => String(lic.id) === String(licenceId));
     if (idx === -1) {
       return res.status(403).json({ success: false, error: 'Licence introuvable pour cet ID.' });
     }
     const licence = list[idx];
 
-    // 3) Crédits
+    // 3) Vérifier crédits (si non illimitée)
     if (licence.abonnement !== 'Illimitée') {
       const credits = Number(licence.credits || 0);
       if (!Number.isFinite(credits) || credits < 1) {
@@ -381,50 +371,55 @@ app.post('/send-sms', async (req, res) => {
       }
     }
 
-    // 4) Envoi SMS
-    const numero = toFR(phoneNumber);
-    const params = new URLSearchParams();
-    params.append('pseudo', process.env.SMSMODE_LOGIN);
-    params.append('pass', process.env.SMSMODE_PASSWORD);
-    params.append('numero', numero);
-    params.append('emetteur', sender);
+    // 4) Appel SMSMode (pseudo + mot de passe) — Unicode texte clair
+const numero = toFR(phoneNumber);
 
-    if (needsUnicode) {
-      // Emojis / caractères non-GSM -> UCS-2 HEX + coding=2 (surtout pas utf8/charset ici)
-      params.append('message', toUCS2BEHex(message));
-      params.append('coding', '2');
-    } else {
-      // Texte basique -> message en clair + utf8/charset ok
-      params.append('message', message);
-      params.append('utf8', '1');
-      params.append('charset', 'UTF-8');
-      // (ne PAS mettre coding dans ce cas)
-    }
+const params = new URLSearchParams();
+params.append('pseudo', process.env.SMSMODE_LOGIN);
+params.append('pass', process.env.SMSMODE_PASSWORD);
 
-    const smsResp = await fetch('https://api.smsmode.com/http/1.6/sendSMS.do', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
-      body: params.toString(),
-    });
+// 🔤 texte en clair (UTF-8) : accents + emojis
+params.append('message', message);
 
-    const smsText = await smsResp.text();
-    console.log('SMSMode status:', smsResp.status);
-    console.log('SMSMode body  :', smsText);
+// ✅ demander l’encodage unicode côté passerelle
+params.append('unicode', '1');
 
-    const smsHasError =
-      !smsResp.ok ||
-      /^32\s*\|/i.test(smsText) ||  // auth KO
-      /^35\s*\|/i.test(smsText) ||  // paramètres manquants
-      /\berror\b/i.test(smsText);
+// ✅ préciser l’encodage utilisé dans la requête
+params.append('charset', 'UTF-8');
 
-    if (smsHasError) {
-      return res.status(502).json({ success: false, error: `Erreur SMSMode: ${smsText}` });
-    }
+// (optionnel mais utile pour >70 caractères UCS-2)
+params.append('smslong', '1');
 
-    // 5) Décrément crédits
+params.append('numero', numero);
+params.append('emetteur', sender);
+
+// ❌ NE PAS mettre: coding / utf8
+const smsResp = await fetch('https://api.smsmode.com/http/1.6/sendSMS.do', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
+  body: params.toString(),
+});
+
+const smsText = await smsResp.text();
+console.log('SMSMode status:', smsResp.status);
+console.log('SMSMode body  :', smsText);
+
+const smsHasError =
+  !smsResp.ok ||
+  /^32\s*\|/i.test(smsText) ||
+  /^35\s*\|/i.test(smsText) ||
+  /\berror\b/i.test(smsText);
+
+if (smsHasError) {
+  return res.status(502).json({ success: false, error: `Erreur SMSMode: ${smsText}` });
+}
+
+
+    // 5) Décrémenter crédits (si non illimitée)
     if (licence.abonnement !== 'Illimitée') {
       licence.credits = Math.max(0, Number(licence.credits || 0) - 1);
       const bodyToPut = Array.isArray(record) ? (list[idx] = licence, list) : licence;
+
       const upd = await fetch(`https://api.jsonbin.io/v3/b/${process.env.JSONBIN_BIN_ID}`, {
         method: 'PUT',
         headers: {
@@ -439,18 +434,21 @@ app.post('/send-sms', async (req, res) => {
       }
     }
 
+    // 6) OK
     return res.json({
       success: true,
       opticienId: licence.id,
       credits: licence.credits,
       abonnement: licence.abonnement,
     });
-
   } catch (err) {
     console.error('Erreur /send-sms:', err);
-    return res.status(500).json({ success: false, error: String(err && err.message ? err.message : err) });
+    return res.status(500).json({ success: false, error: String(err.message || err) });
   }
 });
+
+
+
 
 
 // === Achat de crédits via GoCardless (clients abonnés) ===
