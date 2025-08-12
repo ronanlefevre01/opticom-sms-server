@@ -371,36 +371,49 @@ app.post('/send-sms', async (req, res) => {
       }
     }
 
-    // 4) Appel SMSMode (pseudo + mot de passe) — message UTF-8 + unicode=1 (emojis OK)
-    const numero = toFR(phoneNumber);
+    // 4) Appel SMSMode (pseudo + mot de passe) — Unicode texte clair
+const numero = toFR(phoneNumber);
 
-    const params = new URLSearchParams();
-    params.append('pseudo', process.env.SMSMODE_LOGIN);
-    params.append('pass', process.env.SMSMODE_PASSWORD);
-    params.append('message', message);          // ← en clair (UTF-8)
-    params.append('unicode', '1');              // ← active l’Unicode / emojis
-    params.append('smslong', '1');              // optionnel: concaténation si > 70 caractères
-    params.append('numero', numero);
-    params.append('emetteur', sender);
-    // ⚠️ NE PAS ajouter coding/charset/utf8 avec unicode=1
+const params = new URLSearchParams();
+params.append('pseudo', process.env.SMSMODE_LOGIN);
+params.append('pass', process.env.SMSMODE_PASSWORD);
 
-    const smsResp = await fetch('https://api.smsmode.com/http/1.6/sendSMS.do', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: params.toString(),
-    });
+// 🔤 texte en clair (UTF-8) : accents + emojis
+params.append('message', message);
 
-    const smsText = await smsResp.text();
-    console.log('SMSMode status:', smsResp.status);
-    console.log('SMSMode body  :', smsText);
+// ✅ demander l’encodage unicode côté passerelle
+params.append('unicode', '1');
 
-    // 32 = auth KO ; 35 = params manquants ; "error" générique
-    const smsHasError =
-      !smsResp.ok || /^32\s*\|/i.test(smsText) || /^35\s*\|/i.test(smsText) || /\berror\b/i.test(smsText);
+// ✅ préciser l’encodage utilisé dans la requête
+params.append('charset', 'UTF-8');
 
-    if (smsHasError) {
-      return res.status(502).json({ success: false, error: `Erreur SMSMode: ${smsText}` });
-    }
+// (optionnel mais utile pour >70 caractères UCS-2)
+params.append('smslong', '1');
+
+params.append('numero', numero);
+params.append('emetteur', sender);
+
+// ❌ NE PAS mettre: coding / utf8
+const smsResp = await fetch('https://api.smsmode.com/http/1.6/sendSMS.do', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
+  body: params.toString(),
+});
+
+const smsText = await smsResp.text();
+console.log('SMSMode status:', smsResp.status);
+console.log('SMSMode body  :', smsText);
+
+const smsHasError =
+  !smsResp.ok ||
+  /^32\s*\|/i.test(smsText) ||
+  /^35\s*\|/i.test(smsText) ||
+  /\berror\b/i.test(smsText);
+
+if (smsHasError) {
+  return res.status(502).json({ success: false, error: `Erreur SMSMode: ${smsText}` });
+}
+
 
     // 5) Décrémenter crédits (si non illimitée)
     if (licence.abonnement !== 'Illimitée') {
