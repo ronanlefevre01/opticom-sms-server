@@ -373,7 +373,7 @@ app.post('/send-sms', async (req, res) => {
     params.append('emetteur', sender);
     params.append('utf8', '1');
     params.append('charset', 'UTF-8');
-    params.append('unicode', '1');
+    params.append('coding', '2');
 
     const smsResp = await fetch('https://api.smsmode.com/http/1.6/sendSMS.do', {
       method: 'POST',
