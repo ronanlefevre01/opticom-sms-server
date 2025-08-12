@@ -1,4 +1,4 @@
-require('dotenv').config(); // Charge les variables d'environnement depuis .env
+require('dotenv').config();
 
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -8,118 +8,162 @@ const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 const axios = require('axios');
 const PDFDocument = require('pdfkit');
-const crypto = require('crypto');
 const goCardless = require('gocardless-nodejs');
-const sessionTokenMap = new Map();
+const cookieParser = require('cookie-parser');
+const { URLSearchParams } = require('url');
+
+// fetch (ESM compat)
+const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
+
+const app = express();
+const PORT = process.env.PORT || 3001;
+
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const GO_CARDLESS_API_BASE = 'https://api.gocardless.com';
+
 const goCardlessClient = goCardless(
   process.env.GOCARDLESS_API_KEY,
   process.env.GOCARDLESS_ENV || 'live'
 );
 
+const sessionTokenMap = new Map();
 
+// --- Formules ---
 const formulas = [
   { id: 'starter', name: 'Starter', credits: 100 },
   { id: 'pro', name: 'Pro', credits: 300 },
   { id: 'premium', name: 'Premium', credits: 600 },
-  { id: 'alacarte', name: 'À la carte', credits: 0 }, // pas concerné ici
+  { id: 'alacarte', name: 'À la carte', credits: 0 },
 ];
 
-
-// Chargement conditionnel de node-fetch (compatible avec ES6)
-const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
-const { URLSearchParams } = require('url');
-
-// Initialisation de l'app Express
-const app = express();
-const PORT = process.env.PORT || 3001;
-
-// Configuration de Stripe
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
-
-// Configuration GoCardless Sandbox (ou live si tu changes l'URL)
-const GO_CARDLESS_API_BASE = 'https://api.gocardless.com';
-
-// === Fonctions utilitaires pour charger / enregistrer les licences ===
-const pathLic = path.join(__dirname, 'licences.json');
-
-function chargerLicences() {
-  return fs.existsSync(pathLic) ? JSON.parse(fs.readFileSync(pathLic, 'utf-8')) : [];
-}
-
-function enregistrerLicences(licences) {
-  fs.writeFileSync(pathLic, JSON.stringify(licences, null, 2));
-}
-
-
-
-// 📁 Créer le dossier public/factures s'il n'existe pas
+// --- Dossier factures public ---
 const factureDir = path.join(__dirname, 'public/factures');
-if (!fs.existsSync(factureDir)) {
-  fs.mkdirSync(factureDir, { recursive: true });
-}
+if (!fs.existsSync(factureDir)) fs.mkdirSync(factureDir, { recursive: true });
 
-// 🧩 Middleware
+// --- Middlewares globaux ---
 app.use(cors());
 app.use(bodyParser.json());
 app.use('/webhook-stripe', express.raw({ type: 'application/json' }));
-
-async function enregistrerLicenceEtSync(info, customer, mandate) {
-  const licence = {
-    id: uuidv4(),
-    opticien: {
-      id: 'opt-' + Math.random().toString(36).substring(2, 10),
-      nom: info.prefilled_customer.given_name,
-      prenom: info.prefilled_customer.family_name,
-      email: info.prefilled_customer.email,
-      telephone: info.metadata.telephone,
-      formule: info.metadata.formule,
-      siret: info.metadata.siret,
-    },
-    customer,
-    mandate,
-    credits: 0,
-    createdAt: new Date().toISOString(),
-  };
-
-  const path = './licences.json';
-  let licences = [];
-
-  if (fs.existsSync(path)) {
-    licences = JSON.parse(fs.readFileSync(path, 'utf-8'));
-  }
-
-  licences.push(licence);
-  fs.writeFileSync(path, JSON.stringify(licences, null, 2));
-
-  try {
-    await fetch('https://opti-admin.vercel.app/api/save-licence', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(licence),
-    });
-    console.log('📤 Licence synchronisée avec OptiAdmin');
-  } catch (err) {
-    console.error('❌ Erreur synchronisation licence :', err.message);
-  }
-
-  return licence;
-}
-
-
-// 🍪 Cookies
-const cookieParser = require('cookie-parser');
 app.use(cookieParser());
 app.use(express.static('public'));
 
-// 🧪 Test serveur
-app.get('/', (req, res) => {
-  res.send('✅ Serveur OptiCOM en ligne');
-});
+// --- Ping ---
+app.get('/', (_, res) => res.send('✅ Serveur OptiCOM en ligne'));
 
+// =======================
+//   JSONBIN HELPERS
+// =======================
+const must = (v, name) => {
+  if (!v) throw new Error(`${name} manquant.`);
+  return v;
+};
 
+async function jsonbinGetAll() {
+  const binId = must(process.env.JSONBIN_BIN_ID, 'JSONBIN_BIN_ID');
+  const headers = {
+    'X-Bin-Meta': 'false',
+    ...(process.env.JSONBIN_API_KEY ? { 'X-Master-Key': process.env.JSONBIN_API_KEY } : {}),
+  };
+  const r = await fetch(`https://api.jsonbin.io/v3/b/${binId}/latest`, { headers });
+  if (!r.ok) {
+    const t = await r.text().catch(() => '');
+    throw new Error(`Erreur JSONBin (${r.status}): ${t}`);
+  }
+  const data = await r.json();
+  const record = data?.record ?? data;
+  const list = Array.isArray(record) ? record : [record];
+  return { list, rawRecord: record };
+}
 
-// === 🔐 Créer un mandat GoCardless ===
+async function jsonbinPutAll(body) {
+  const binId = must(process.env.JSONBIN_BIN_ID, 'JSONBIN_BIN_ID');
+  const headers = {
+    'Content-Type': 'application/json',
+    ...(process.env.JSONBIN_API_KEY ? { 'X-Master-Key': process.env.JSONBIN_API_KEY } : {}),
+    'X-Bin-Versioning': 'false',
+  };
+  const r = await fetch(`https://api.jsonbin.io/v3/b/${binId}`, {
+    method: 'PUT',
+    headers,
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const t = await r.text().catch(() => '');
+    throw new Error(`Erreur mise à jour JSONBin: ${t}`);
+  }
+}
 
+function findLicenceIndex(list, predicate) {
+  const idx = list.findIndex(predicate);
+  return { idx, licence: idx >= 0 ? list[idx] : null };
+}
+
+// =======================
+//   SMS & SIGNATURE
+// =======================
+function normalizeSender(raw = 'OptiCOM') {
+  let s = String(raw).replace(/[^a-zA-Z0-9]/g, '');
+  if (s.length < 3) s = 'OptiCOM';
+  if (s.length > 11) s = s.slice(0, 11);
+  return s;
+}
+
+function normalizeTextForCompare(s = '') {
+  return String(s)
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/[\s\-–—_*|·•.,;:!?"'`~()]+/g, '')
+    .toLowerCase();
+}
+function hasSignature(message = '', signature = '') {
+  if (!signature) return true;
+  const m = normalizeTextForCompare(message);
+  const sig = normalizeTextForCompare(signature);
+  return sig.length > 0 && m.includes(sig);
+}
+function appendSignature(message = '', signature = '') {
+  if (!signature) return (message || '').trim();
+  const trimmed = (message || '').trim();
+  return trimmed.length ? `${trimmed}\n${signature}` : signature;
+}
+function buildFinalMessage(rawMessage = '', signature = '') {
+  if (!signature) return (rawMessage || '').trim();
+  return hasSignature(rawMessage, signature) ? (rawMessage || '').trim() : appendSignature(rawMessage, signature);
+}
+function toFRNumber(raw = '') {
+  return String(raw).replace(/[^\d+]/g, '').replace(/^0/, '+33');
+}
+
+// Middleware — prépare sender/signature + licence JSONBin (licenceId ou opticienId)
+async function applySenderAndSignature(req, res, next) {
+  try {
+    const { sender, signature: sigFromClient, licenceId, opticienId } = req.body || {};
+    const { list } = await jsonbinGetAll();
+
+    let found = { idx: -1, licence: null };
+    if (licenceId) {
+      found = findLicenceIndex(list, l => String(l.id) === String(licenceId));
+    } else if (opticienId) {
+      found = findLicenceIndex(list, l => String(l.opticien?.id) === String(opticienId));
+    }
+
+    const licence = found.licence;
+    const candidateSender = sender || licence?.libelleExpediteur || licence?.opticien?.nom || 'OptiCOM';
+    const normalizedSender = normalizeSender(candidateSender);
+    const signatureFromLicence = licence?.signature || ''; // si tu stockes la signature côté licence
+    const chosenSignature = (sigFromClient || signatureFromLicence || '').trim();
+
+    req._jsonbin = { list, rawRecord: (await jsonbinGetAll()).rawRecord }; // charge à nouveau record proprement
+    req.smsContext = { licence, idx: found.idx, sender: normalizedSender, signature: chosenSignature };
+    next();
+  } catch (e) {
+    console.error('applySenderAndSignature error:', e);
+    res.status(500).json({ success: false, error: 'SERVER_SIGNATURE_SENDER_MIDDLEWARE_FAILED' });
+  }
+}
+
+// ===============================
+//   GoCardless: mandat & licence
+// ===============================
 app.post('/create-mandat', async (req, res) => {
   const {
     nom, prenom, email, adresse, ville,
@@ -128,18 +172,15 @@ app.post('/create-mandat', async (req, res) => {
 
   try {
     const session_token = uuidv4();
-
     const customerData = {
-  email: email,
-  company_name: nom,           // ou `${prenom} ${nom}` si tu veux afficher le nom du gérant
-  address_line1: adresse,
-  city: ville,
-  postal_code: codePostal,
-  country_code: pays || 'FR',  // par défaut à FR si non fourni
-};
+      email,
+      company_name: nom,
+      address_line1: adresse,
+      city: ville,
+      postal_code: codePostal,
+      country_code: pays || 'FR',
+    };
 
-
-    // Créer le redirect flow via GoCardless API
     const response = await fetch(`${GO_CARDLESS_API_BASE}/redirect_flows`, {
       method: 'POST',
       headers: {
@@ -159,47 +200,29 @@ app.post('/create-mandat', async (req, res) => {
     });
 
     const data = await response.json();
-
     if (!response.ok || !data.redirect_flows?.redirect_url) {
       console.error('❌ Erreur GoCardless :', data.error);
       return res.status(500).json({ error: 'Erreur GoCardless. Vérifiez vos informations.' });
     }
 
-    const redirectFlow = data.redirect_flows;
-
-    // 🧠 Stocke temporairement les infos opticien associées au session_token
     sessionTokenMap.set(session_token, {
-      nom, prenom, email, adresse, ville,
-      codePostal, pays, formuleId, siret, telephone
+      nom, prenom, email, adresse, ville, codePostal, pays, formuleId, siret, telephone
     });
 
-    // 🔁 Redirige vers GoCardless pour signature
-    const redirectUrl = redirectFlow.redirect_url;
-    res.status(200).json({ url: redirectUrl });
-
+    res.status(200).json({ url: data.redirect_flows.redirect_url });
   } catch (err) {
     console.error('❗ Exception GoCardless:', err);
-    return res.status(500).json({ error: 'Erreur serveur GoCardless. Veuillez réessayer.' });
+    res.status(500).json({ error: 'Erreur serveur GoCardless. Veuillez réessayer.' });
   }
 });
-
-
 
 app.get('/validation-mandat', async (req, res) => {
   const redirectFlowId = req.query.redirect_flow_id;
   const sessionToken = req.query.session_token;
-
-  if (!redirectFlowId || !sessionToken) {
-    return res.status(400).send('Paramètre manquant ou session expirée.');
-  }
+  if (!redirectFlowId || !sessionToken) return res.status(400).send('Paramètre manquant ou session expirée.');
 
   try {
-    const confirmResponse = await goCardlessClient.redirectFlows.complete(redirectFlowId, {
-      session_token: sessionToken,
-    });
-
-    console.log("✅ confirmResponse =", confirmResponse);
-
+    const confirmResponse = await goCardlessClient.redirectFlows.complete(redirectFlowId, { session_token: sessionToken });
     const flow = confirmResponse;
     if (!flow || !flow.links || !flow.links.customer) {
       console.error("❌ Erreur GoCardless : réponse invalide", confirmResponse);
@@ -208,20 +231,13 @@ app.get('/validation-mandat', async (req, res) => {
 
     const customerId = flow.links.customer;
     const mandateId = flow.links.mandate;
-
-    // 🔸 Récupérer les données de l’opticien
     const opticien = sessionTokenMap.get(sessionToken);
-    if (!opticien) {
-      return res.status(400).send('Données opticien manquantes ou session expirée.');
-    }
+    if (!opticien) return res.status(400).send('Données opticien manquantes ou session expirée.');
 
-    // 🔸 Trouver la formule choisie (grâce au tableau global `formulas`)
     const selectedFormule = formulas.find(f => f.id === opticien.formuleId) || { name: "Formule inconnue", credits: 0 };
-
     const abonnement = selectedFormule.name;
     const credits = selectedFormule.credits;
 
-    // 🔸 Générer la licence
     const licenceKey = uuidv4();
     const newLicence = {
       id: uuidv4(),
@@ -230,6 +246,7 @@ app.get('/validation-mandat', async (req, res) => {
       abonnement,
       credits,
       opticien: {
+        id: 'opt-' + Math.random().toString(36).slice(2, 10),
         nom: opticien.nom,
         prenom: opticien.prenom,
         email: opticien.email,
@@ -244,14 +261,12 @@ app.get('/validation-mandat', async (req, res) => {
       customerId
     };
 
-    // 🔸 Enregistrement sur JSONBin
-    const binId = process.env.JSONBIN_BIN_ID;
-    const apiKey = process.env.JSONBIN_API_KEY;
+    const binId = must(process.env.JSONBIN_BIN_ID, 'JSONBIN_BIN_ID');
+    const apiKey = must(process.env.JSONBIN_API_KEY, 'JSONBIN_API_KEY');
 
     const getResponse = await axios.get(`https://api.jsonbin.io/v3/b/${binId}/latest`, {
       headers: { 'X-Master-Key': apiKey }
     });
-
     let licences = getResponse.data.record || [];
     licences.push(newLicence);
 
@@ -265,12 +280,10 @@ app.get('/validation-mandat', async (req, res) => {
 
     sessionTokenMap.delete(sessionToken);
 
-    // 🔸 Réponse JSON (si appelée depuis l'app)
     if (req.headers.accept?.includes('application/json')) {
       return res.json(newLicence);
     }
 
-    // 🔸 Réponse HTML (navigateur)
     res.send(`
       <html>
         <head>
@@ -298,72 +311,31 @@ app.get('/validation-mandat', async (req, res) => {
   }
 });
 
-
-// Route: envoi SMS avec auth SMSMode par pseudo/mot de passe (HTTP 1.6)
-// Helper : convertit une chaîne en UCS-2 big-endian hex pour SMSMode (unicode=1)
-const toUCS2Hex = (str) => {
-  const s = (str ?? '').normalize('NFC');
-  const le = Buffer.from(s, 'utf16le'); // 2 octets par caractère (LE)
-  let hex = '';
-  for (let i = 0; i < le.length; i += 2) {
-    // inverser l’ordre pour faire du BE: high byte puis low byte
-    hex += le[i + 1].toString(16).padStart(2, '0') + le[i].toString(16).padStart(2, '0');
-  }
-  return hex.toUpperCase();
-};
-
-app.post('/send-sms', async (req, res) => {
-  const { phoneNumber, message, emetteur, licenceId } = req.body;
-
-  // Champs requis
-  if (!phoneNumber || !message || !emetteur || !licenceId) {
+// ============================
+//   Envoi SMS (tout JSONBin)
+// ============================
+app.post('/send-sms', applySenderAndSignature, async (req, res) => {
+  const { phoneNumber, message, licenceId, opticienId } = req.body || {};
+  if (!phoneNumber || !message || (!licenceId && !opticienId)) {
     return res.status(400).json({ success: false, error: 'Champs manquants.' });
-  }
-
-  // ENV requis
-  if (!process.env.JSONBIN_BIN_ID) {
-    return res.status(500).json({ success: false, error: 'JSONBIN_BIN_ID manquant.' });
   }
   if (!process.env.SMSMODE_LOGIN || !process.env.SMSMODE_PASSWORD) {
     return res.status(500).json({ success: false, error: 'SMSMODE_LOGIN / SMSMODE_PASSWORD manquants.' });
   }
 
-  // Normalise émetteur (3–11 alphanum)
-  const normalizeSender = (s = '') => {
-    let x = String(s).replace(/[^a-zA-Z0-9]/g, '');
-    if (x.length > 11) x = x.slice(0, 11);
-    if (x.length < 3) x = 'OptiCOM';
-    return x;
-  };
-  const sender = normalizeSender(emetteur);
-
-  // Normalise numéro (FR)
-  const toFR = (raw = '') => String(raw).replace(/[^\d+]/g, '').replace(/^0/, '+33');
-
   try {
-    // 1) Lire licences depuis JSONBin
-    const rBin = await fetch(`https://api.jsonbin.io/v3/b/${process.env.JSONBIN_BIN_ID}/latest`, {
-      headers: {
-        ...(process.env.JSONBIN_API_KEY ? { 'X-Master-Key': process.env.JSONBIN_API_KEY } : {}),
-        'X-Bin-Meta': 'false',
-      },
-    });
-    if (!rBin.ok) {
-      const body = await rBin.text().catch(() => '');
-      throw new Error(`Erreur JSONBin (${rBin.status}): ${body}`);
-    }
-    const bin = await rBin.json();
-    const record = bin?.record ?? bin;
-    const list = Array.isArray(record) ? record : [record];
+    const { list, rawRecord } = await jsonbinGetAll();
 
-    // 2) Chercher la licence par ID
-    const idx = list.findIndex((lic) => String(lic.id) === String(licenceId));
-    if (idx === -1) {
-      return res.status(403).json({ success: false, error: 'Licence introuvable pour cet ID.' });
+    let found = { idx: -1, licence: null };
+    if (licenceId) {
+      found = findLicenceIndex(list, l => String(l.id) === String(licenceId));
+    } else {
+      found = findLicenceIndex(list, l => String(l.opticien?.id) === String(opticienId));
     }
-    const licence = list[idx];
+    if (found.idx === -1) return res.status(403).json({ success: false, error: 'Licence introuvable.' });
 
-    // 3) Vérifier crédits (si non illimitée)
+    const licence = found.licence;
+
     if (licence.abonnement !== 'Illimitée') {
       const credits = Number(licence.credits || 0);
       if (!Number.isFinite(credits) || credits < 1) {
@@ -371,108 +343,85 @@ app.post('/send-sms', async (req, res) => {
       }
     }
 
-    // 4) Appel SMSMode (pseudo + mot de passe) — Unicode texte clair
-const numero = toFR(phoneNumber);
+    const numero = toFRNumber(phoneNumber);
+    const { sender, signature } = req.smsContext;
+    const finalMessage = buildFinalMessage(message, signature);
 
-const params = new URLSearchParams();
-params.append('pseudo', process.env.SMSMODE_LOGIN);
-params.append('pass', process.env.SMSMODE_PASSWORD);
+    const params = new URLSearchParams();
+    params.append('pseudo', process.env.SMSMODE_LOGIN);
+    params.append('pass', process.env.SMSMODE_PASSWORD);
+    params.append('message', finalMessage);
+    params.append('unicode', '1');
+    params.append('charset', 'UTF-8');
+    params.append('smslong', '1');
+    params.append('numero', numero);
+    params.append('emetteur', sender);
 
-// 🔤 texte en clair (UTF-8) : accents + emojis
-params.append('message', message);
+    const smsResp = await fetch('https://api.smsmode.com/http/1.6/sendSMS.do', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
+      body: params.toString(),
+    });
 
-// ✅ demander l’encodage unicode côté passerelle
-params.append('unicode', '1');
+    const smsText = await smsResp.text();
+    const smsHasError =
+      !smsResp.ok ||
+      /^32\s*\|/i.test(smsText) ||
+      /^35\s*\|/i.test(smsText) ||
+      /\berror\b/i.test(smsText);
 
-// ✅ préciser l’encodage utilisé dans la requête
-params.append('charset', 'UTF-8');
-
-// (optionnel mais utile pour >70 caractères UCS-2)
-params.append('smslong', '1');
-
-params.append('numero', numero);
-params.append('emetteur', sender);
-
-// ❌ NE PAS mettre: coding / utf8
-const smsResp = await fetch('https://api.smsmode.com/http/1.6/sendSMS.do', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
-  body: params.toString(),
-});
-
-const smsText = await smsResp.text();
-console.log('SMSMode status:', smsResp.status);
-console.log('SMSMode body  :', smsText);
-
-const smsHasError =
-  !smsResp.ok ||
-  /^32\s*\|/i.test(smsText) ||
-  /^35\s*\|/i.test(smsText) ||
-  /\berror\b/i.test(smsText);
-
-if (smsHasError) {
-  return res.status(502).json({ success: false, error: `Erreur SMSMode: ${smsText}` });
-}
-
-
-    // 5) Décrémenter crédits (si non illimitée)
-    if (licence.abonnement !== 'Illimitée') {
-      licence.credits = Math.max(0, Number(licence.credits || 0) - 1);
-      const bodyToPut = Array.isArray(record) ? (list[idx] = licence, list) : licence;
-
-      const upd = await fetch(`https://api.jsonbin.io/v3/b/${process.env.JSONBIN_BIN_ID}`, {
-        method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(process.env.JSONBIN_API_KEY ? { 'X-Master-Key': process.env.JSONBIN_API_KEY } : {}),
-        },
-        body: JSON.stringify(bodyToPut),
-      });
-      if (!upd.ok) {
-        const t = await upd.text().catch(() => '');
-        throw new Error(`Erreur mise à jour JSONBin: ${t}`);
-      }
+    if (smsHasError) {
+      return res.status(502).json({ success: false, error: `Erreur SMSMode: ${smsText}` });
     }
 
-    // 6) OK
+    if (licence.abonnement !== 'Illimitée') {
+      licence.credits = Math.max(0, Number(licence.credits || 0) - 1);
+      const bodyToPut = Array.isArray(rawRecord) ? (list[found.idx] = licence, list) : licence;
+      await jsonbinPutAll(bodyToPut);
+    }
+
     return res.json({
       success: true,
-      opticienId: licence.id,
+      licenceId: licence.id,
       credits: licence.credits,
       abonnement: licence.abonnement,
+      sender,
+      message: finalMessage,
     });
   } catch (err) {
     console.error('Erreur /send-sms:', err);
-    return res.status(500).json({ success: false, error: String(err.message || err) });
+    res.status(500).json({ success: false, error: String(err.message || err) });
   }
 });
 
+// Alias transactionnel
+app.post('/send-transactional', applySenderAndSignature, async (req, res) => {
+  req.body = { ...req.body, licenceId: req.body.licenceId, opticienId: req.body.opticienId };
+  return app._router.handle(req, res, () => {}, 'post', '/send-sms');
+});
 
+// Alias promotionnel (même décrémentation, seul endpoint SMSMode change si besoin)
+app.post('/send-promotional', applySenderAndSignature, async (req, res) => {
+  // On réutilise la même logique que /send-sms (HTTP 1.6 classique). Si tu utilises l’endpoint marketing dédié, remplace ci-dessous.
+  req.body = { ...req.body, licenceId: req.body.licenceId, opticienId: req.body.opticienId };
+  return app._router.handle(req, res, () => {}, 'post', '/send-sms');
+});
 
-
-
-// === Achat de crédits via GoCardless (clients abonnés) ===
+// ===================================
+//   Achat de crédits via GoCardless
+// ===================================
 app.post('/achat-credits-gocardless', async (req, res) => {
   const { email, quantity } = req.body;
   const qty = Math.max(1, parseInt(quantity || '1'));
 
   try {
-    const pathLicences = './licences.json';
-    const licences = fs.existsSync(pathLicences)
-      ? JSON.parse(fs.readFileSync(pathLicences, 'utf-8'))
-      : [];
+    const { list, rawRecord } = await jsonbinGetAll();
+    const { idx, licence } = findLicenceIndex(list, l => String(l.opticien?.email).toLowerCase() === String(email).toLowerCase());
+    if (idx === -1) return res.status(404).json({ error: "Licence introuvable" });
 
-    const index = licences.findIndex(l => l.opticien?.email === email);
-    if (index === -1) {
-      return res.status(404).json({ error: "Licence introuvable" });
-    }
+    const mandate = licence.mandateId; // JSONBin: mandateId
+    if (!mandate) return res.status(400).json({ error: "Aucun mandat associé à cette licence" });
 
-    const mandate = licences[index].mandate;
-    if (!mandate) {
-      return res.status(400).json({ error: "Aucun mandat associé à cette licence" });
-    }
-
-    // Paiement via GoCardless
     const response = await fetch(`${GO_CARDLESS_API_BASE}/payments`, {
       method: 'POST',
       headers: {
@@ -482,62 +431,68 @@ app.post('/achat-credits-gocardless', async (req, res) => {
       },
       body: JSON.stringify({
         payments: {
-          amount: 6 * qty * 100, // montant en centimes
+          amount: 6 * qty * 100,
           currency: 'EUR',
           links: { mandate },
           description: `Achat ponctuel de ${qty * 100} crédits SMS - OptiCOM`,
-          metadata: {
-            email,
-            type: 'achat-credits',
-            quantity: qty.toString()
-          }
+          metadata: { email, type: 'achat-credits', quantity: String(qty) }
         }
       })
     });
 
     const data = await response.json();
-
     if (!response.ok) {
       console.error('❗ Erreur GoCardless :', JSON.stringify(data, null, 2));
       return res.status(500).json({ error: 'Échec du paiement GoCardless.' });
     }
 
-    // Ajout des crédits
     const creditsAjoutes = qty * 100;
-    licences[index].credits += creditsAjoutes;
-    fs.writeFileSync(pathLicences, JSON.stringify(licences, null, 2));
+    licence.credits = (Number(licence.credits) || 0) + creditsAjoutes;
+    const bodyToPut = Array.isArray(rawRecord) ? (list[idx] = licence, list) : licence;
+    await jsonbinPutAll(bodyToPut);
 
-    // Générer facture
+    // Générer facture PDF + enregistrer lien dans licence.factures
     const facturePayload = {
-      opticien: licences[index].opticien,
+      opticien: licence.opticien,
       type: 'Achat de crédits SMS (GoCardless)',
-      montant: 6 * qty, // en euros
+      montant: 6 * qty,
       details: `${creditsAjoutes} crédits achetés via GoCardless`
     };
-
     try {
       const factureResponse = await fetch(`http://localhost:${PORT}/api/generate-invoice`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(facturePayload)
       });
-
       const factureData = await factureResponse.json();
-      console.log(`📄 Facture générée automatiquement : ${factureData.url}`);
-    } catch (factureErr) {
-      console.error('❌ Erreur génération facture :', factureErr);
+
+      const { list: list2, rawRecord: rec2 } = await jsonbinGetAll();
+      const { idx: idx2 } = findLicenceIndex(list2, l => String(l.id) === String(licence.id));
+      if (idx2 !== -1) {
+        if (!Array.isArray(list2[idx2].factures)) list2[idx2].factures = [];
+        list2[idx2].factures.push({
+          date: new Date().toISOString(),
+          url: factureData.url,
+          type: 'GoCardless',
+          montant: 6 * qty,
+          credits: creditsAjoutes
+        });
+        await jsonbinPutAll(Array.isArray(rec2) ? list2 : list2[idx2]);
+      }
+    } catch (e) {
+      console.error('❌ Erreur génération facture :', e);
     }
 
-    return res.json({ success: true, creditsAjoutes });
-
+    res.json({ success: true, creditsAjoutes });
   } catch (err) {
     console.error('❗ Erreur achat GoCardless (serveur) :', err);
-    return res.status(500).json({ error: 'Erreur serveur inattendue' });
+    res.status(500).json({ error: 'Erreur serveur inattendue' });
   }
 });
 
-
-// === Créer une session Stripe ===
+// =======================
+//   Stripe: checkout + WH
+// =======================
 app.post('/create-checkout-session', async (req, res) => {
   const { clientEmail, quantity } = req.body;
   const qty = Math.max(1, parseInt(quantity || '1'));
@@ -546,22 +501,17 @@ app.post('/create-checkout-session', async (req, res) => {
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ['card'],
       mode: 'payment',
-      line_items: [
-        {
-          price_data: {
-            currency: 'eur',
-            product_data: { name: 'Crédits SMS OptiCOM (lot de 100)' },
-            unit_amount: 1700,
-          },
-          quantity: qty,
+      line_items: [{
+        price_data: {
+          currency: 'eur',
+          product_data: { name: 'Crédits SMS OptiCOM (lot de 100)' },
+          unit_amount: 1700,
         },
-      ],
+        quantity: qty,
+      }],
       success_url: `opticom://merci-achat?credits=${qty * 100}`,
       cancel_url: 'opticom://annulation-achat',
-      metadata: {
-        email: clientEmail || '',
-        quantity: qty.toString(),
-      },
+      metadata: { email: clientEmail || '', quantity: String(qty) },
     });
 
     res.json({ url: session.url });
@@ -571,12 +521,10 @@ app.post('/create-checkout-session', async (req, res) => {
   }
 });
 
-// === Webhook Stripe pour ajout de crédits ===
 app.post('/webhook-stripe', express.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
   const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
   let event;
-
   try {
     event = stripe.webhooks.constructEvent(req.body, sig, endpointSecret);
   } catch (err) {
@@ -588,49 +536,51 @@ app.post('/webhook-stripe', express.raw({ type: 'application/json' }), async (re
     const session = event.data.object;
     const email = session.metadata?.email;
     const quantity = parseInt(session.metadata?.quantity || '1');
-
-    if (!email) return res.status(200).send('OK');
-
-    const pathLic = './licences.json';
-    let licences = fs.existsSync(pathLic) ? JSON.parse(fs.readFileSync(pathLic, 'utf-8')) : [];
-    const index = licences.findIndex(l => l.opticien?.email === email);
-
-    if (index !== -1) {
-      // 1. Ajouter les crédits
-      const creditsAjoutes = 100 * quantity;
-      licences[index].credits = (licences[index].credits || 0) + creditsAjoutes;
-
-      // 2. Générer la facture
-      const facturePayload = {
-        opticien: licences[index].opticien,
-        type: 'Achat de crédits SMS (Stripe)',
-        montant: 17 * quantity,
-        details: `${creditsAjoutes} crédits achetés`
-      };
-
+    if (email) {
       try {
-        const response = await fetch(`http://localhost:${PORT}/api/generate-invoice`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(facturePayload),
-        });
+        const { list, rawRecord } = await jsonbinGetAll();
+        const { idx } = findLicenceIndex(list, l => String(l.opticien?.email).toLowerCase() === String(email).toLowerCase());
+        if (idx !== -1) {
+          const creditsAjoutes = 100 * quantity;
+          list[idx].credits = (Number(list[idx].credits) || 0) + creditsAjoutes;
 
-        const data = await response.json();
+          // Générer facture PDF
+          const facturePayload = {
+            opticien: list[idx].opticien,
+            type: 'Achat de crédits SMS (Stripe)',
+            montant: 17 * quantity,
+            details: `${creditsAjoutes} crédits achetés`
+          };
+          let invoiceUrl = null;
+          try {
+            const response = await fetch(`http://localhost:${PORT}/api/generate-invoice`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(facturePayload),
+            });
+            const data = await response.json();
+            invoiceUrl = data.url;
+          } catch (e) {
+            console.error('❌ Erreur génération facture Stripe :', e);
+          }
 
-        // 3. Sauvegarder le lien de la facture dans la licence
-        if (!licences[index].factures) licences[index].factures = [];
-        licences[index].factures.push({
-          date: new Date().toISOString(),
-          url: data.url,
-          type: 'Stripe',
-          montant: 17 * quantity,
-          credits: creditsAjoutes
-        });
+          if (!Array.isArray(list[idx].factures)) list[idx].factures = [];
+          if (invoiceUrl) {
+            list[idx].factures.push({
+              date: new Date().toISOString(),
+              url: invoiceUrl,
+              type: 'Stripe',
+              montant: 17 * quantity,
+              credits: creditsAjoutes
+            });
+          }
 
-        fs.writeFileSync(pathLic, JSON.stringify(licences, null, 2));
-        console.log(`✅ ${creditsAjoutes} crédits ajoutés + facture générée pour ${email}`);
-      } catch (err) {
-        console.error('❌ Erreur génération facture Stripe :', err);
+          const bodyToPut = Array.isArray(rawRecord) ? list : list[idx];
+          await jsonbinPutAll(bodyToPut);
+          console.log(`✅ ${creditsAjoutes} crédits ajoutés (Stripe) pour ${email}`);
+        }
+      } catch (e) {
+        console.error('❌ Webhook Stripe JSONBin error:', e);
       }
     }
   }
@@ -638,13 +588,12 @@ app.post('/webhook-stripe', express.raw({ type: 'application/json' }), async (re
   res.status(200).send('OK');
 });
 
-// === Génération d'une facture PDF ===
-app.post('/api/generate-invoice', (req, res) => {
-  const { opticien, type, montant, details } = req.body;
-
-  if (!opticien || !opticien.id) {
-    return res.status(400).json({ error: 'Opticien manquant ou invalide' });
-  }
+// =======================
+//   Facture PDF (JSONBin)
+// =======================
+app.post('/api/generate-invoice', async (req, res) => {
+  const { opticien, type, montant, details } = req.body || {};
+  if (!opticien || !opticien.id) return res.status(400).json({ error: 'Opticien manquant ou invalide' });
 
   const fileName = `facture-${opticien.id}-${uuidv4()}.pdf`;
   const filePath = path.join(__dirname, 'public/factures', fileName);
@@ -656,38 +605,24 @@ app.post('/api/generate-invoice', (req, res) => {
   doc.fontSize(20).text('📄 Facture OptiCOM', { align: 'center' });
   doc.moveDown();
   doc.fontSize(12).text(`Nom : ${opticien.nom}`);
-  doc.text(`SIRET : ${opticien.siret}`);
+  doc.text(`SIRET : ${opticien.siret || '—'}`);
   doc.text(`Email : ${opticien.email}`);
-  doc.text(`Téléphone : ${opticien.telephone}`);
+  doc.text(`Téléphone : ${opticien.telephone || '—'}`);
   doc.moveDown();
   doc.text(`Type de facture : ${type}`);
-  doc.text(`Montant TTC : ${montant.toFixed(2)} €`);
+  doc.text(`Montant TTC : ${Number(montant).toFixed(2)} €`);
   doc.text(`Détails : ${details}`);
   doc.text(`Date : ${new Date().toLocaleDateString('fr-FR')}`);
   doc.end();
 
-  stream.on('finish', () => {
+  stream.on('finish', async () => {
     try {
-      const licencesPath = path.join(__dirname, 'licences.json');
-      const licences = JSON.parse(fs.readFileSync(licencesPath, 'utf-8'));
-
-      const index = licences.findIndex(l => l.opticien?.id === opticien.id);
-      if (index !== -1) {
-        if (!licences[index].factures) {
-          licences[index].factures = [];
-        }
-
-        licences[index].factures.push(fileName);
-        fs.writeFileSync(licencesPath, JSON.stringify(licences, null, 2));
-        console.log(`✅ Facture enregistrée dans licences.json pour ${opticien.email}`);
-      } else {
-        console.warn(`⚠️ Opticien ID ${opticien.id} introuvable dans licences.json`);
-      }
-
+      // On ne push pas ici dans la licence pour éviter double-édition concurrente.
+      // Les routes appelantes (Stripe / GoCardless) ajoutent l’URL dans licence.factures.
       res.json({ url: `/factures/${fileName}` });
     } catch (err) {
-      console.error('❌ Erreur mise à jour licences.json :', err);
-      res.status(500).json({ error: 'PDF généré mais erreur mise à jour licences.json' });
+      console.error('❌ Erreur après PDF:', err);
+      res.status(500).json({ error: 'PDF généré mais mise à jour échouée' });
     }
   });
 
@@ -697,112 +632,9 @@ app.post('/api/generate-invoice', (req, res) => {
   });
 });
 
-app.post('/send-transactional', async (req, res) => {
-  const { phoneNumber, message, senderLabel, opticienId } = req.body;
-
-  if (!opticienId) return res.status(400).json({ success: false, error: 'Opticien ID manquant' });
-
-  const licences = chargerLicences();
-  const index = licences.findIndex(l => l.opticien?.id === opticienId);
-
-  if (index === -1) return res.status(404).json({ success: false, error: 'Licence introuvable' });
-
-  if ((licences[index].credits || 0) <= 0) {
-    return res.status(403).json({ success: false, error: 'Crédits épuisés' });
-  }
-
-  try {
-    const response = await axios.post(
-      'https://api.smsmode.com/http/1.6/sendSMS.do',
-      null,
-      {
-        params: {
-          accessToken: process.env.SMSMODE_API_KEY,
-          message,
-          numero: phoneNumber.replace(/^0/, '+33'),
-          emetteur: senderLabel || 'Opticien',
-        },
-      }
-    );
-
-    // Décrémenter 1 crédit
-    licences[index].credits -= 1;
-    enregistrerLicences(licences);
-
-    res.json({ success: true, data: response.data });
-  } catch (error) {
-    console.error('Erreur SMS transactionnel :', error.message);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-app.post('/send-promotional', async (req, res) => {
-  const { phoneNumber, message, senderLabel, opticienId } = req.body;
-
-  if (!opticienId) return res.status(400).json({ success: false, error: 'Opticien ID manquant' });
-
-  const licences = chargerLicences();
-  const index = licences.findIndex(l => l.opticien?.id === opticienId);
-
-  if (index === -1) return res.status(404).json({ success: false, error: 'Licence introuvable' });
-
-  if ((licences[index].credits || 0) <= 0) {
-    return res.status(403).json({ success: false, error: 'Crédits épuisés' });
-  }
-
-  try {
-    const response = await axios.post(
-      'https://api.smsmode.com/http/1.6/sendMarketingSMS.do',
-      null,
-      {
-        params: {
-          accessToken: process.env.SMSMODE_API_KEY,
-          message,
-          numero: phoneNumber.replace(/^0/, '+33'),
-          emetteur: senderLabel || 'Opticien',
-        },
-      }
-    );
-
-    // Décrémenter 1 crédit
-    licences[index].credits -= 1;
-    enregistrerLicences(licences);
-
-    res.json({ success: true, data: response.data });
-  } catch (error) {
-    console.error('Erreur SMS promotionnel :', error.message);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-
-// === Récupérer les crédits restants d’un opticien ===
-app.get('/api/credits/:opticienId', (req, res) => {
-  const { opticienId } = req.params;
-
-  if (!opticienId) {
-    return res.status(400).json({ error: 'ID opticien manquant.' });
-  }
-
-  const pathLic = path.join(__dirname, 'licences.json');
-  if (!fs.existsSync(pathLic)) {
-    return res.status(500).json({ error: 'Fichier licences.json introuvable.' });
-  }
-
-  const licences = JSON.parse(fs.readFileSync(pathLic, 'utf-8'));
-  const licence = licences.find(l => l.opticien?.id === opticienId);
-
-  if (!licence) {
-    return res.status(404).json({ error: 'Opticien introuvable.' });
-  }
-
-  res.json({ credits: licence.credits || 0 });
-});
-
-
-
-// === Lancement serveur ===
+// =======================
+//   Lancement serveur
+// =======================
 app.listen(PORT, () => {
   console.log(`✅ Serveur prêt sur http://localhost:${PORT}`);
 });
-
