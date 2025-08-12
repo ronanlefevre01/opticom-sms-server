@@ -16,6 +16,7 @@ const goCardlessClient = goCardless(
   process.env.GOCARDLESS_ENV || 'live'
 );
 
+
 const formulas = [
   { id: 'starter', name: 'Starter', credits: 100 },
   { id: 'pro', name: 'Pro', credits: 300 },
@@ -299,6 +300,18 @@ app.get('/validation-mandat', async (req, res) => {
 
 
 // Route: envoi SMS avec auth SMSMode par pseudo/mot de passe (HTTP 1.6)
+// Helper : convertit une chaîne en UCS-2 big-endian hex pour SMSMode (unicode=1)
+const toUCS2Hex = (str) => {
+  const s = (str ?? '').normalize('NFC');
+  const le = Buffer.from(s, 'utf16le'); // 2 octets par caractère (LE)
+  let hex = '';
+  for (let i = 0; i < le.length; i += 2) {
+    // inverser l’ordre pour faire du BE: high byte puis low byte
+    hex += le[i + 1].toString(16).padStart(2, '0') + le[i].toString(16).padStart(2, '0');
+  }
+  return hex.toUpperCase();
+};
+
 app.post('/send-sms', async (req, res) => {
   const { phoneNumber, message, emetteur, licenceId } = req.body;
 
@@ -363,21 +376,26 @@ app.post('/send-sms', async (req, res) => {
       }
     }
 
-    // 4) Appel SMSMode (pseudo + mot de passe)
+    // 4) Appel SMSMode (pseudo + mot de passe) en **Unicode UCS-2**
     const numero = toFR(phoneNumber);
+
+    // IMPORTANT: en unicode=1, 'message' doit être en UCS-2 BE hex
+    const msgHex = toUCS2Hex(message);
+
     const params = new URLSearchParams();
     params.append('pseudo', process.env.SMSMODE_LOGIN);
     params.append('pass', process.env.SMSMODE_PASSWORD);
-    params.append('message', message);
+    params.append('message', msgHex);   // <-- UCS-2 hex
+    params.append('unicode', '1');      // <-- indique l’Unicode
+    params.append('smslong', '1');      // optionnel: concaténation si >70 chars
     params.append('numero', numero);
     params.append('emetteur', sender);
-    params.append('utf8', '1');
-    params.append('charset', 'UTF-8');
-    params.append('coding', '2');
+
+    // ⚠️ ne PAS mettre utf8/charset/coding ici (ça casse les emojis)
 
     const smsResp = await fetch('https://api.smsmode.com/http/1.6/sendSMS.do', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: params.toString(),
     });
 
@@ -401,7 +419,6 @@ app.post('/send-sms', async (req, res) => {
     if (licence.abonnement !== 'Illimitée') {
       licence.credits = Math.max(0, Number(licence.credits || 0) - 1);
 
-      // reconstruire la payload PUT (array vs objet)
       const bodyToPut = Array.isArray(record) ? (list[idx] = licence, list) : licence;
 
       const upd = await fetch(`https://api.jsonbin.io/v3/b/${process.env.JSONBIN_BIN_ID}`, {
@@ -432,6 +449,7 @@ app.post('/send-sms', async (req, res) => {
     return res.status(500).json({ success: false, error: String(err.message || err) });
   }
 });
+
 
 
 // === Achat de crédits via GoCardless (clients abonnés) ===
