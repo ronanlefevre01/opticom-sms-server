@@ -655,6 +655,84 @@ app.post('/api/generate-invoice', async (req, res) => {
   });
 });
 
+app.post('/changer-formule', async (req, res) => {
+  const { email, nouvelleFormule } = req.body;
+  if (!email || !nouvelleFormule) {
+    return res.status(400).json({ error: 'Email et nouvelle formule requis' });
+  }
+
+  try {
+    const { list, rawRecord } = await jsonbinGetAll();
+    const { idx, licence } = findLicenceIndex(list, l => String(l.opticien?.email).toLowerCase() === String(email).toLowerCase());
+    if (idx === -1) return res.status(404).json({ error: "Licence introuvable" });
+
+    if (!licence.next_payment_date) {
+      return res.status(400).json({ error: "Aucune date de renouvellement trouvée" });
+    }
+
+    licence.nouvelleFormule = nouvelleFormule;
+    licence.dateChangement = licence.next_payment_date; // Activation à la prochaine échéance
+
+    const bodyToPut = Array.isArray(rawRecord) ? (list[idx] = licence, list) : licence;
+    await jsonbinPutAll(bodyToPut);
+
+    res.json({ success: true, message: `Formule ${nouvelleFormule} programmée pour le ${licence.dateChangement}` });
+  } catch (err) {
+    console.error('❗ Erreur changer-formule :', err);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+const cron = require('node-cron');
+
+cron.schedule('0 0 * * *', async () => { // Tous les jours à minuit
+  console.log('⏳ Vérification des changements de formule...');
+  try {
+    const { list, rawRecord } = await jsonbinGetAll();
+    let updated = false;
+
+    for (let licence of list) {
+      if (licence.nouvelleFormule && licence.dateChangement) {
+        const today = new Date().toISOString().split('T')[0];
+        if (today >= licence.dateChangement) {
+          console.log(`🔄 Passage de ${licence.opticien?.email} à la formule ${licence.nouvelleFormule}`);
+
+          // Mise à jour de la formule dans la licence
+          licence.formule = licence.nouvelleFormule;
+          delete licence.nouvelleFormule;
+          delete licence.dateChangement;
+          updated = true;
+
+          // Montant en centimes selon la formule
+          const tarifs = { Starter: 600, Pro: 1200, Premium: 1800 };
+          const amount = tarifs[licence.formule] || 600;
+
+          // Mise à jour du mandat GoCardless
+          await fetch(`${GO_CARDLESS_API_BASE}/subscriptions/${licence.subscriptionId}`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${process.env.GOCARDLESS_API_KEY}`,
+              'GoCardless-Version': '2015-07-06'
+            },
+            body: JSON.stringify({
+              subscriptions: { amount }
+            })
+          });
+        }
+      }
+    }
+
+    if (updated) {
+      await jsonbinPutAll(list);
+      console.log('✅ Formules mises à jour');
+    }
+  } catch (err) {
+    console.error('❌ Erreur CRON changement formule :', err);
+  }
+});
+
+
 // =======================
 //   Lancement serveur
 // =======================
