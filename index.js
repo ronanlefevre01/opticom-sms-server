@@ -410,18 +410,32 @@ app.post('/send-promotional', applySenderAndSignature, async (req, res) => {
 // ===================================
 //   Achat de crédits via GoCardless
 // ===================================
+// Prix et TVA (utilisés pour le calcul TTC)
+const PRICE_HT_PER_PACK = 6.00; // € HT pour 100 SMS
+const TVA_RATE = 0.20;          // 20 %
+
 app.post('/achat-credits-gocardless', async (req, res) => {
   const { email, quantity } = req.body;
-  const qty = Math.max(1, parseInt(quantity || '1'));
+  const qty = Math.max(1, parseInt(quantity || '1', 10));
 
   try {
     const { list, rawRecord } = await jsonbinGetAll();
-    const { idx, licence } = findLicenceIndex(list, l => String(l.opticien?.email).toLowerCase() === String(email).toLowerCase());
+    const { idx, licence } = findLicenceIndex(
+      list,
+      l => String(l.opticien?.email).toLowerCase() === String(email).toLowerCase()
+    );
     if (idx === -1) return res.status(404).json({ error: "Licence introuvable" });
 
     const mandate = licence.mandateId; // JSONBin: mandateId
     if (!mandate) return res.status(400).json({ error: "Aucun mandat associé à cette licence" });
 
+    // 💰 Calculs à partir du HT
+    const totalHT  = +(PRICE_HT_PER_PACK * qty).toFixed(2);            // ex: 6.00 * 2 = 12.00
+    const totalTVA = +(totalHT * TVA_RATE).toFixed(2);                 // ex: 2.40
+    const totalTTC = +(totalHT + totalTVA).toFixed(2);                 // ex: 14.40
+    const amountCents = Math.round(totalTTC * 100);                    // ex: 1440 centimes
+
+    // 🧾 Création du paiement GoCardless (Toujours TTC en centimes)
     const response = await fetch(`${GO_CARDLESS_API_BASE}/payments`, {
       method: 'POST',
       headers: {
@@ -431,10 +445,10 @@ app.post('/achat-credits-gocardless', async (req, res) => {
       },
       body: JSON.stringify({
         payments: {
-          amount: 6 * qty * 100,
+          amount: amountCents,                 // ✅ TTC en centimes
           currency: 'EUR',
           links: { mandate },
-          description: `Achat ponctuel de ${qty * 100} crédits SMS - OptiCOM`,
+          description: `Achat ${qty * 100} SMS — ${totalHT.toFixed(2)} € HT + TVA`,
           metadata: { email, type: 'achat-credits', quantity: String(qty) }
         }
       })
@@ -443,21 +457,27 @@ app.post('/achat-credits-gocardless', async (req, res) => {
     const data = await response.json();
     if (!response.ok) {
       console.error('❗ Erreur GoCardless :', JSON.stringify(data, null, 2));
-      return res.status(500).json({ error: 'Échec du paiement GoCardless.' });
+      // Essaie d’exposer le vrai message GC si présent
+      const gcMsg = data?.error?.message || 'Échec du paiement GoCardless.';
+      return res.status(500).json({ error: gcMsg, details: data?.error || data });
     }
 
+    // ➕ Ajout des crédits
     const creditsAjoutes = qty * 100;
     licence.credits = (Number(licence.credits) || 0) + creditsAjoutes;
     const bodyToPut = Array.isArray(rawRecord) ? (list[idx] = licence, list) : licence;
     await jsonbinPutAll(bodyToPut);
 
-    // Générer facture PDF + enregistrer lien dans licence.factures
+    // 📄 Générer la facture PDF + enregistrer le lien dans licence.factures
+    // On passe le montant TTC à l’endpoint (il affiche "Montant TTC")
+    // et on met le détail HT/TVA/TTC dans "details" pour transparence.
     const facturePayload = {
       opticien: licence.opticien,
       type: 'Achat de crédits SMS (GoCardless)',
-      montant: 6 * qty,
-      details: `${creditsAjoutes} crédits achetés via GoCardless`
+      montant: totalTTC, // ✅ TTC
+      details: `${creditsAjoutes} crédits — ${qty}×100 SMS | HT: ${totalHT.toFixed(2)} € | TVA (20%): ${totalTVA.toFixed(2)} € | TTC: ${totalTTC.toFixed(2)} €`
     };
+
     try {
       const factureResponse = await fetch(`http://localhost:${PORT}/api/generate-invoice`, {
         method: 'POST',
@@ -466,6 +486,7 @@ app.post('/achat-credits-gocardless', async (req, res) => {
       });
       const factureData = await factureResponse.json();
 
+      // Ajout du lien PDF dans la licence sur JSONBin
       const { list: list2, rawRecord: rec2 } = await jsonbinGetAll();
       const { idx: idx2 } = findLicenceIndex(list2, l => String(l.id) === String(licence.id));
       if (idx2 !== -1) {
@@ -474,7 +495,9 @@ app.post('/achat-credits-gocardless', async (req, res) => {
           date: new Date().toISOString(),
           url: factureData.url,
           type: 'GoCardless',
-          montant: 6 * qty,
+          montantHT: totalHT,
+          tva: totalTVA,
+          montantTTC: totalTTC,
           credits: creditsAjoutes
         });
         await jsonbinPutAll(Array.isArray(rec2) ? list2 : list2[idx2]);
@@ -483,12 +506,13 @@ app.post('/achat-credits-gocardless', async (req, res) => {
       console.error('❌ Erreur génération facture :', e);
     }
 
-    res.json({ success: true, creditsAjoutes });
+    return res.json({ success: true, creditsAjoutes, montantHT: totalHT, montantTTC: totalTTC });
   } catch (err) {
     console.error('❗ Erreur achat GoCardless (serveur) :', err);
-    res.status(500).json({ error: 'Erreur serveur inattendue' });
+    return res.status(500).json({ error: 'Erreur serveur inattendue' });
   }
 });
+
 
 // =======================
 //   Stripe: checkout + WH
