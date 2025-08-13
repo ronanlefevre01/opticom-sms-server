@@ -11,6 +11,8 @@ const PDFDocument = require('pdfkit');
 const goCardless = require('gocardless-nodejs');
 const cookieParser = require('cookie-parser');
 const { URLSearchParams } = require('url');
+const multer = require('multer'); // ← AJOUT
+
 
 // fetch (ESM compat)
 const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
@@ -40,6 +42,20 @@ const formulas = [
 const factureDir = path.join(__dirname, 'public/factures');
 if (!fs.existsSync(factureDir)) fs.mkdirSync(factureDir, { recursive: true });
 
+// Servir les PDF publiquement : https://<host>/factures/<fichier>.pdf
+app.use(
+  '/factures',
+  express.static(factureDir, {
+    index: false,
+    maxAge: '1y',
+    setHeaders: (res) => {
+      res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+      res.setHeader('Content-Disposition', 'inline'); // affiche le PDF dans le navigateur
+    },
+  })
+);
+
+
 // --- Middlewares globaux ---
 app.use(cors());
 app.use(bodyParser.json());
@@ -49,6 +65,41 @@ app.use(express.static('public'));
 
 // --- Ping ---
 app.get('/', (_, res) => res.send('✅ Serveur OptiCOM en ligne'));
+
+// ===== Upload de facture (PDF) protégé par token =====
+const ADMIN_UPLOAD_TOKEN = process.env.ADMIN_UPLOAD_TOKEN;
+
+function requireAdminToken(req, res, next) {
+  if (!ADMIN_UPLOAD_TOKEN) return res.status(500).json({ error: 'ADMIN_UPLOAD_TOKEN manquant côté serveur' });
+  const auth = req.get('authorization') || '';
+  if (auth !== `Bearer ${ADMIN_UPLOAD_TOKEN}`) return res.status(401).json({ error: 'unauthorized' });
+  next();
+}
+
+// Multer: enregistre directement le fichier dans public/factures
+const storage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, factureDir),
+  filename: (req, _file, cb) => {
+    const numero = (req.body.numero && String(req.body.numero).trim()) || uuidv4();
+    const safe = numero.replace(/[^A-Za-z0-9-_]/g, '_');
+    cb(null, `${safe}.pdf`);
+  },
+});
+const upload = multer({
+  storage,
+  limits: { fileSize: 15 * 1024 * 1024 }, // 15 MB
+  fileFilter: (_req, file, cb) => cb(null, file.mimetype === 'application/pdf'),
+});
+
+// POST /api/upload-facture  (form-data: numero?, pdf)
+// Réponse: { ok, numero, filename, url }
+app.post('/api/upload-facture', requireAdminToken, upload.single('pdf'), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: "Fichier PDF manquant (champ 'pdf')." });
+  const numero = String(req.body.numero || path.basename(req.file.filename, '.pdf'));
+  const url = `${req.protocol}://${req.get('host')}/factures/${req.file.filename}`;
+  res.json({ ok: true, numero, filename: req.file.filename, url });
+});
+
 
 // =======================
 //   JSONBIN HELPERS
@@ -685,6 +736,39 @@ app.post('/achat-credits-gocardless', async (req, res) => {
   }
 });
 
+app.post('/resiliation-abonnement', async (req, res) => {
+  try {
+    const { email, licenceId } = req.body || {};
+    if (!email && !licenceId) {
+      return res.status(400).json({ success: false, error: 'EMAIL_OU_LICENCE_ID_REQUIS' });
+    }
+
+    const { list, rawRecord } = await jsonbinGetAll();
+
+    let { idx, licence } =
+      licenceId
+        ? findLicenceIndex(list, l => String(l.id) === String(licenceId))
+        : findLicenceIndex(list, l => String(l.opticien?.email).toLowerCase() === String(email).toLowerCase());
+
+    if (idx === -1) return res.status(404).json({ success: false, error: 'LICENCE_INTROUVABLE' });
+
+    // On prend la prochaine échéance connue pour la date de fin
+    const dateResiliation =
+      licence.renouvellement || licence.next_payment_date || new Date().toISOString().slice(0, 10);
+
+    licence.resiliationDemandee = true;
+    licence.dateResiliation = dateResiliation;
+
+    const bodyToPut = Array.isArray(rawRecord) ? (list[idx] = licence, list) : licence;
+    await jsonbinPutAll(bodyToPut);
+
+    return res.json({ success: true, dateResiliation });
+  } catch (e) {
+    console.error('❌ /resiliation-abonnement error:', e);
+    return res.status(500).json({ success: false, error: 'SERVER_ERROR' });
+  }
+});
+
 
 
 // =======================
@@ -857,54 +941,159 @@ app.post('/changer-formule', async (req, res) => {
   }
 });
 
+app.post('/resiliation-abonnement', async (req, res) => {
+  try {
+    const { email, licenceId } = req.body || {};
+    if (!email && !licenceId) {
+      return res.status(400).json({ success: false, error: 'EMAIL_OU_LICENCE_ID_REQUIS' });
+    }
+
+    const { list, rawRecord } = await jsonbinGetAll();
+
+    let { idx, licence } =
+      licenceId
+        ? findLicenceIndex(list, l => String(l.id) === String(licenceId))
+        : findLicenceIndex(list, l => String(l.opticien?.email).toLowerCase() === String(email).toLowerCase());
+
+    if (idx === -1) return res.status(404).json({ success: false, error: 'LICENCE_INTROUVABLE' });
+
+    // On prend la prochaine échéance connue pour la date de fin
+    const dateResiliation =
+      licence.renouvellement || licence.next_payment_date || new Date().toISOString().slice(0, 10);
+
+    licence.resiliationDemandee = true;
+    licence.dateResiliation = dateResiliation;
+
+    const bodyToPut = Array.isArray(rawRecord) ? (list[idx] = licence, list) : licence;
+    await jsonbinPutAll(bodyToPut);
+
+    return res.json({ success: true, dateResiliation });
+  } catch (e) {
+    console.error('❌ /resiliation-abonnement error:', e);
+    return res.status(500).json({ success: false, error: 'SERVER_ERROR' });
+  }
+});
+
+
 const cron = require('node-cron');
 
-cron.schedule('0 0 * * *', async () => { // Tous les jours à minuit
-  console.log('⏳ Vérification des changements de formule...');
+const ISO = (d = new Date()) => d.toISOString().slice(0, 10); // YYYY-MM-DD
+
+// Montants (centimes) par formule pour GoCardless
+const TARIFS_GC = { Starter: 600, Pro: 1200, Premium: 1800 };
+
+cron.schedule('0 3 * * *', async () => { // tous les jours à 03:00
+  console.log('⏳ CRON: vérification formules & résiliations...');
+  const today = ISO();
+
   try {
     const { list, rawRecord } = await jsonbinGetAll();
     let updated = false;
+    const toDelete = []; // indices licences à supprimer du JSONBin
 
-    for (let licence of list) {
+    for (let i = 0; i < list.length; i++) {
+      const licence = list[i];
+
+      // ---------- 1) CHANGEMENT DE FORMULE À L’ÉCHÉANCE ----------
       if (licence.nouvelleFormule && licence.dateChangement) {
-        const today = new Date().toISOString().split('T')[0];
-        if (today >= licence.dateChangement) {
-          console.log(`🔄 Passage de ${licence.opticien?.email} à la formule ${licence.nouvelleFormule}`);
+        if (today >= String(licence.dateChangement).slice(0, 10)) {
+          const newPlan = String(licence.nouvelleFormule);
+          console.log(`🔄 Passage de ${licence.opticien?.email} à la formule ${newPlan}`);
 
-          // Mise à jour de la formule dans la licence
-          licence.formule = licence.nouvelleFormule;
+          // Mets à jour le champ *abonnement* (actuelle source dans le front)
+          licence.abonnement = newPlan;
           delete licence.nouvelleFormule;
           delete licence.dateChangement;
           updated = true;
 
-          // Montant en centimes selon la formule
-          const tarifs = { Starter: 600, Pro: 1200, Premium: 1800 };
-          const amount = tarifs[licence.formule] || 600;
+          // Ajuste le montant GoCardless si on a un subscriptionId
+          const amount = TARIFS_GC[newPlan] || TARIFS_GC.Starter;
+          if (licence.subscriptionId) {
+            try {
+              await fetch(`${GO_CARDLESS_API_BASE}/subscriptions/${licence.subscriptionId}`, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': `Bearer ${process.env.GOCARDLESS_API_KEY}`,
+                  'GoCardless-Version': '2015-07-06',
+                },
+                body: JSON.stringify({ subscriptions: { amount } }),
+              });
+              console.log(`✅ Subscription mise à jour (${amount} centimes) pour ${licence.opticien?.email}`);
+            } catch (e) {
+              console.error('❌ GC update subscription amount:', e);
+            }
+          }
+        }
+      }
 
-          // Mise à jour du mandat GoCardless
-          await fetch(`${GO_CARDLESS_API_BASE}/subscriptions/${licence.subscriptionId}`, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': `Bearer ${process.env.GOCARDLESS_API_KEY}`,
-              'GoCardless-Version': '2015-07-06'
-            },
-            body: JSON.stringify({
-              subscriptions: { amount }
-            })
-          });
+      // ---------- 2) RÉSILIATION À LA DATE PROGRAMMÉE ----------
+      if (licence.resiliationDate) {
+        const cut = String(licence.resiliationDate).slice(0, 10);
+        if (today >= cut) {
+          console.log(`🛑 Résiliation effective pour ${licence.opticien?.email} (date ${cut})`);
+
+          // Arrête les débits côté GoCardless (subscription si présente, sinon mandat)
+          try {
+            if (licence.subscriptionId) {
+              // annule l’abonnement (immédiat)
+              await fetch(`${GO_CARDLESS_API_BASE}/subscriptions/${licence.subscriptionId}/actions/cancel`, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': `Bearer ${process.env.GOCARDLESS_API_KEY}`,
+                  'GoCardless-Version': '2015-07-06',
+                },
+                body: JSON.stringify({}), // rien à passer
+              });
+              console.log(`✅ Subscription annulée pour ${licence.opticien?.email}`);
+            } else if (licence.mandateId) {
+              // pas d’abonnement géré : on annule le mandat pour bloquer tout futur débit
+              await fetch(`${GO_CARDLESS_API_BASE}/mandates/${licence.mandateId}/actions/cancel`, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': `Bearer ${process.env.GOCARDLESS_API_KEY}`,
+                  'GoCardless-Version': '2015-07-06',
+                },
+                body: JSON.stringify({}),
+              });
+              console.log(`✅ Mandat annulé pour ${licence.opticien?.email}`);
+            }
+          } catch (e) {
+            console.error('❌ GC cancel (subscription/mandate):', e);
+          }
+
+          // Supprime la licence du JSONBin pour bloquer l’accès depuis l’app
+          licence.active = false;
+delete licence.licence;        // optionnel: retirer la clé d’accès
+delete licence.credits;        // optionnel
+updated = true;
+
         }
       }
     }
 
+    // ---------- 3) ÉCRITURE JSONBIN ----------
+    if (toDelete.length) {
+      // supprime en partant de la fin pour conserver les index
+      toDelete.sort((a, b) => b - a).forEach(idx => list.splice(idx, 1));
+      updated = true;
+      console.log(`🧹 ${toDelete.length} licence(s) supprimée(s) du JSONBin (résiliation).`);
+    }
+
     if (updated) {
-      await jsonbinPutAll(list);
-      console.log('✅ Formules mises à jour');
+      // jsonbinPutAll sait gérer array vs objet unique via rawRecord
+      await jsonbinPutAll(Array.isArray(rawRecord) ? list : list[0] || {});
+      console.log('✅ CRON: mises à jour sauvegardées.');
+    } else {
+      console.log('👌 CRON: rien à faire aujourd’hui.');
     }
   } catch (err) {
-    console.error('❌ Erreur CRON changement formule :', err);
+    console.error('❌ Erreur CRON:', err);
   }
 });
+
 
 
 // =======================
