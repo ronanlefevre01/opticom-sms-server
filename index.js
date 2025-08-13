@@ -306,7 +306,7 @@ app.post('/create-mandat', async (req, res) => {
           session_token,
           success_redirect_url: `https://opticom-sms-server.onrender.com/validation-mandat?session_token=${session_token}`,
           prefilled_customer: customerData,
-          metadata: { formuleId, siret, telephone, enseigne }
+          metadata: { formuleId, siret, enseigne }
         }
       })
     });
