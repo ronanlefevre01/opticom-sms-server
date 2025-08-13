@@ -99,6 +99,101 @@ function findLicenceIndex(list, predicate) {
 }
 
 // =======================
+//   Licence update helper
+// =======================
+async function updateLicenceFields({ licenceId, opticienId, patch = {} }) {
+  const { list, rawRecord } = await jsonbinGetAll();
+
+  const { idx, licence } = findLicenceIndex(
+    list,
+    (l) =>
+      (licenceId && String(l.id) === String(licenceId)) ||
+      (opticienId && String(l.opticien?.id) === String(opticienId))
+  );
+  if (idx === -1 || !licence) {
+    return { ok: false, status: 404, error: 'LICENCE_NOT_FOUND' };
+  }
+
+  const updated = { ...licence, ...patch, updatedAt: new Date().toISOString() };
+  const bodyToPut = Array.isArray(rawRecord) ? (list[idx] = updated, list) : updated;
+  await jsonbinPutAll(bodyToPut);
+
+  return { ok: true, licence: updated };
+}
+
+
+// =======================
+//   Licence: expéditeur
+// =======================
+app.post('/licence/expediteur', async (req, res) => {
+  try {
+    const { licenceId, opticienId, libelleExpediteur } = req.body || {};
+    if (!libelleExpediteur) {
+      return res.status(400).json({ success: false, error: 'LIBELLE_MANQUANT' });
+    }
+
+    // normalisation: alphanum, 3..11 chars (contraintes opérateur SMS)
+    const cleaned = String(libelleExpediteur).replace(/[^a-zA-Z0-9]/g, '').slice(0, 11);
+    if (cleaned.length < 3) {
+      return res.status(400).json({ success: false, error: 'LIBELLE_INVALIDE' });
+    }
+
+    const { list, rawRecord } = await jsonbinGetAll();
+
+    let found = { idx: -1, licence: null };
+    if (licenceId) {
+      found = findLicenceIndex(list, l => String(l.id) === String(licenceId));
+    } else if (opticienId) {
+      found = findLicenceIndex(list, l => String(l.opticien?.id) === String(opticienId));
+    }
+    if (found.idx === -1) {
+      return res.status(404).json({ success: false, error: 'LICENCE_INTRouvable' });
+    }
+
+    list[found.idx].libelleExpediteur = cleaned;
+
+    const bodyToPut = Array.isArray(rawRecord) ? list : list[found.idx];
+    await jsonbinPutAll(bodyToPut);
+
+    res.json({ success: true, licence: list[found.idx] });
+  } catch (e) {
+    console.error('❌ /licence/expediteur error:', e);
+    res.status(500).json({ success: false, error: 'SERVER_ERROR' });
+  }
+});
+
+// =======================
+//   Licence: signature SMS
+// =======================
+app.post('/licence/signature', async (req, res) => {
+  try {
+    const { licenceId, opticienId, signature } = req.body || {};
+    if (typeof signature !== 'string') {
+      return res.status(400).json({ success: false, error: 'SIGNATURE_MANQUANTE' });
+    }
+
+    // hygiène côté serveur (trim + limite raisonnable)
+    const clean = String(signature).trim().slice(0, 200);
+
+    const result = await updateLicenceFields({
+      licenceId,
+      opticienId,
+      patch: { signature: clean },
+    });
+
+    if (!result.ok) {
+      return res.status(result.status || 500).json({ success: false, error: result.error });
+    }
+    return res.json({ success: true, licence: result.licence });
+  } catch (e) {
+    console.error('❌ /licence/signature error:', e);
+    res.status(500).json({ success: false, error: 'SERVER_ERROR' });
+  }
+});
+
+
+
+// =======================
 //   SMS & SIGNATURE
 // =======================
 function normalizeSender(raw = 'OptiCOM') {
@@ -133,27 +228,29 @@ function toFRNumber(raw = '') {
   return String(raw).replace(/[^\d+]/g, '').replace(/^0/, '+33');
 }
 
+
 // Middleware — prépare sender/signature + licence JSONBin (licenceId ou opticienId)
 async function applySenderAndSignature(req, res, next) {
   try {
     const { sender, signature: sigFromClient, licenceId, opticienId } = req.body || {};
-    const { list } = await jsonbinGetAll();
+    const { list, rawRecord } = await jsonbinGetAll();
 
-    let found = { idx: -1, licence: null };
-    if (licenceId) {
-      found = findLicenceIndex(list, l => String(l.id) === String(licenceId));
-    } else if (opticienId) {
-      found = findLicenceIndex(list, l => String(l.opticien?.id) === String(opticienId));
-    }
+    let { idx, licence } = findLicenceIndex(
+      list,
+      (l) =>
+        (licenceId && String(l.id) === String(licenceId)) ||
+        (opticienId && String(l.opticien?.id) === String(opticienId))
+    );
 
-    const licence = found.licence;
-    const candidateSender = sender || licence?.libelleExpediteur || licence?.opticien?.nom || 'OptiCOM';
+    // fallback permissif : pas bloquant si on n'a pas de licence (mais /send-sms vérifiera)
+    const candidateSender = sender || licence?.libelleExpediteur || licence?.opticien?.enseigne || 'OptiCOM';
     const normalizedSender = normalizeSender(candidateSender);
-    const signatureFromLicence = licence?.signature || ''; // si tu stockes la signature côté licence
+    const signatureFromLicence = licence?.signature || '';
     const chosenSignature = (sigFromClient || signatureFromLicence || '').trim();
 
-    req._jsonbin = { list, rawRecord: (await jsonbinGetAll()).rawRecord }; // charge à nouveau record proprement
-    req.smsContext = { licence, idx: found.idx, sender: normalizedSender, signature: chosenSignature };
+    // on garde ce qu'il faut si d'autres routes veulent écrire
+    req._jsonbin = { list, rawRecord, idx, licence };
+    req.smsContext = { licence, idx, sender: normalizedSender, signature: chosenSignature };
     next();
   } catch (e) {
     console.error('applySenderAndSignature error:', e);
@@ -161,24 +258,34 @@ async function applySenderAndSignature(req, res, next) {
   }
 }
 
+
 // ===============================
 //   GoCardless: mandat & licence
 // ===============================
 app.post('/create-mandat', async (req, res) => {
   const {
-    nom, prenom, email, adresse, ville,
-    codePostal, pays, formuleId, siret, telephone
+    enseigne,            // <-- on attend "enseigne" au lieu de nom/prenom
+    email,
+    adresse,
+    ville,
+    codePostal,
+    pays,
+    formuleId,
+    siret,
+    telephone
   } = req.body;
 
   try {
     const session_token = uuidv4();
+
+    // Données client pré-remplies pour GoCardless
     const customerData = {
       email,
-      company_name: nom,
+      company_name: enseigne || 'Magasin', // <-- nom d'entreprise = enseigne
       address_line1: adresse,
       city: ville,
       postal_code: codePostal,
-      country_code: pays || 'FR',
+      country_code: (pays || 'FR').toUpperCase(),
     };
 
     const response = await fetch(`${GO_CARDLESS_API_BASE}/redirect_flows`, {
@@ -194,7 +301,7 @@ app.post('/create-mandat', async (req, res) => {
           session_token,
           success_redirect_url: `https://opticom-sms-server.onrender.com/validation-mandat?session_token=${session_token}`,
           prefilled_customer: customerData,
-          metadata: { formuleId, siret, telephone }
+          metadata: { formuleId, siret, telephone, enseigne } // <-- on garde l'enseigne aussi en metadata
         }
       })
     });
@@ -205,8 +312,17 @@ app.post('/create-mandat', async (req, res) => {
       return res.status(500).json({ error: 'Erreur GoCardless. Vérifiez vos informations.' });
     }
 
+    // On garde les infos utiles en session (plus de nom/prenom)
     sessionTokenMap.set(session_token, {
-      nom, prenom, email, adresse, ville, codePostal, pays, formuleId, siret, telephone
+      enseigne: enseigne || 'Magasin',
+      email,
+      adresse,
+      ville,
+      codePostal,
+      pays: (pays || 'FR').toUpperCase(),
+      formuleId,
+      siret,
+      telephone
     });
 
     res.status(200).json({ url: data.redirect_flows.redirect_url });
@@ -216,61 +332,92 @@ app.post('/create-mandat', async (req, res) => {
   }
 });
 
+
 app.get('/validation-mandat', async (req, res) => {
   const redirectFlowId = req.query.redirect_flow_id;
-  const sessionToken = req.query.session_token;
-  if (!redirectFlowId || !sessionToken) return res.status(400).send('Paramètre manquant ou session expirée.');
+  const sessionToken   = req.query.session_token;
+  if (!redirectFlowId || !sessionToken) {
+    return res.status(400).send('Paramètre manquant ou session expirée.');
+  }
+
+  // petite util pour normaliser l’émetteur (3..11 alphanum)
+  const normalizeSender = (raw = 'OptiCOM') => {
+    let s = String(raw).toUpperCase().replace(/[^A-Z0-9]/g, '');
+    if (s.length < 3) s = 'OPTICOM';
+    if (s.length > 11) s = s.slice(0, 11);
+    return s;
+  };
 
   try {
-    const confirmResponse = await goCardlessClient.redirectFlows.complete(redirectFlowId, { session_token: sessionToken });
+    // 1) Confirme le redirect flow
+    const confirmResponse = await goCardlessClient.redirectFlows.complete(
+      redirectFlowId,
+      { session_token: sessionToken }
+    );
+
     const flow = confirmResponse;
     if (!flow || !flow.links || !flow.links.customer) {
-      console.error("❌ Erreur GoCardless : réponse invalide", confirmResponse);
-      return res.status(500).send("Erreur GoCardless : réponse invalide lors de la confirmation.");
+      console.error('❌ Erreur GoCardless : réponse invalide', confirmResponse);
+      return res.status(500).send('Erreur GoCardless : réponse invalide lors de la confirmation.');
     }
 
     const customerId = flow.links.customer;
-    const mandateId = flow.links.mandate;
-    const opticien = sessionTokenMap.get(sessionToken);
-    if (!opticien) return res.status(400).send('Données opticien manquantes ou session expirée.');
+    const mandateId  = flow.links.mandate;
 
-    const selectedFormule = formulas.find(f => f.id === opticien.formuleId) || { name: "Formule inconnue", credits: 0 };
+    // 2) Récupère les infos mises en session dans /create-mandat (avec enseigne)
+    const opt = sessionTokenMap.get(sessionToken);
+    if (!opt) return res.status(400).send('Données opticien manquantes ou session expirée.');
+
+    const selectedFormule = formulas.find(f => f.id === opt.formuleId) || { name: 'Formule inconnue', credits: 0 };
     const abonnement = selectedFormule.name;
-    const credits = selectedFormule.credits;
+    const credits    = selectedFormule.credits;
 
     const licenceKey = uuidv4();
+
+    // libellé expéditeur par défaut = enseigne normalisée
+    const libelleExpediteur = normalizeSender(opt.enseigne || 'OptiCOM');
+
+    // 3) Construit la licence (plus de nom/prénom côté opticien)
     const newLicence = {
       id: uuidv4(),
       licence: licenceKey,
       dateCreation: new Date().toISOString(),
       abonnement,
       credits,
+      libelleExpediteur, // <-- stocké dès la création
       opticien: {
         id: 'opt-' + Math.random().toString(36).slice(2, 10),
-        nom: opticien.nom,
-        prenom: opticien.prenom,
-        email: opticien.email,
-        adresse: opticien.adresse,
-        ville: opticien.ville,
-        codePostal: opticien.codePostal,
-        pays: opticien.pays,
-        telephone: opticien.telephone,
-        siret: opticien.siret
+        enseigne: opt.enseigne,   // source de vérité
+        // nom conservé pour compat descendante du front (peut être retiré plus tard)
+        nom: opt.enseigne,
+        email: opt.email,
+        adresse: opt.adresse,
+        ville: opt.ville,
+        codePostal: opt.codePostal,
+        pays: opt.pays,
+        telephone: opt.telephone,
+        siret: opt.siret
       },
       mandateId,
       customerId
     };
 
+    // 4) Sauvegarde JSONBin (gère array OU objet)
     const binId = must(process.env.JSONBIN_BIN_ID, 'JSONBIN_BIN_ID');
     const apiKey = must(process.env.JSONBIN_API_KEY, 'JSONBIN_API_KEY');
 
     const getResponse = await axios.get(`https://api.jsonbin.io/v3/b/${binId}/latest`, {
-      headers: { 'X-Master-Key': apiKey }
+      headers: { 'X-Master-Key': apiKey, 'X-Bin-Meta': 'false' }
     });
-    let licences = getResponse.data.record || [];
-    licences.push(newLicence);
 
-    await axios.put(`https://api.jsonbin.io/v3/b/${binId}`, licences, {
+    const record = getResponse.data?.record ?? getResponse.data;
+    const list   = Array.isArray(record) ? record : (record ? [record] : []);
+    list.push(newLicence);
+
+    // Si le bin contenait un objet unique, on remet un objet; sinon on remet la liste
+    const bodyToPut = Array.isArray(record) ? list : newLicence;
+
+    await axios.put(`https://api.jsonbin.io/v3/b/${binId}`, bodyToPut, {
       headers: {
         'Content-Type': 'application/json',
         'X-Master-Key': apiKey,
@@ -278,38 +425,61 @@ app.get('/validation-mandat', async (req, res) => {
       }
     });
 
+    // 5) Nettoie la session
     sessionTokenMap.delete(sessionToken);
 
+    // 6) Si on veut du JSON
     if (req.headers.accept?.includes('application/json')) {
       return res.json(newLicence);
     }
 
+    // 7) Page HTML avec bouton "Copier"
     res.send(`
       <html>
         <head>
           <title>Licence validée</title>
+          <meta charset="utf-8" />
           <style>
             body { font-family: sans-serif; padding: 30px; background: #f7f7f7; }
-            .box { background: white; border-radius: 10px; padding: 20px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+            .box { background: white; border-radius: 10px; padding: 20px; box-shadow: 0 0 10px rgba(0,0,0,0.1); max-width: 640px; margin: 0 auto; }
             h1 { color: #2e7d32; }
             code { background: #eee; padding: 5px 10px; font-size: 1.2em; border-radius: 5px; }
+            .row { display: flex; align-items: center; gap: 10px; }
+            .copy-btn { padding: 6px 10px; border: none; background: #2e7d32; color: #fff; border-radius: 6px; cursor: pointer; }
+            .copy-btn:hover { background: #256628; }
+            .hint { color: #666; font-size: 0.95em; }
           </style>
         </head>
         <body>
           <div class="box">
             <h1>🎉 Votre mandat est validé !</h1>
-            <p>Voici votre clé de licence :</p>
-            <p><code>${licenceKey}</code></p>
-            <p>Vous pouvez maintenant retourner dans l'application OptiCOM et la saisir dans l'onglet <strong>“J'ai déjà une licence”</strong>.</p>
+            <p class="hint">Voici votre clé de licence :</p>
+            <p class="row">
+              <code id="licenceKey">${licenceKey}</code>
+              <button class="copy-btn" onclick="copyLicence()">📋 Copier</button>
+            </p>
+            <p>Vous pouvez maintenant retourner dans l'application OptiCOM et la saisir dans l'onglet <strong>« J'ai déjà une licence »</strong>.</p>
           </div>
+
+          <script>
+            function copyLicence() {
+              const txt = document.getElementById('licenceKey').textContent;
+              navigator.clipboard.writeText(txt).then(() => {
+                alert('Clé copiée !');
+              }).catch(err => {
+                alert('Impossible de copier la clé : ' + err);
+              });
+            }
+          </script>
         </body>
       </html>
     `);
   } catch (error) {
     console.error('❌ Erreur validation mandat :', error?.error || error);
-    res.status(500).send("Erreur lors de la validation du mandat.");
+    res.status(500).send('Erreur lors de la validation du mandat.');
   }
 });
+
 
 // ============================
 //   Envoi SMS (tout JSONBin)
