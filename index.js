@@ -974,6 +974,18 @@ app.post('/resiliation-abonnement', async (req, res) => {
   }
 });
 
+// --- Expose la liste des licences (lecture seule) ---
+app.get('/api/licences', async (req, res) => {
+  try {
+    const { list } = await jsonbinGetAll(); // utilise JSONBIN_BIN_ID + JSONBIN_API_KEY côté Render
+    res.json(Array.isArray(list) ? list : (list ? [list] : []));
+  } catch (e) {
+    console.error('❌ /api/licences error:', e);
+    res.status(500).json({ error: 'JSONBIN_READ_FAILED', detail: String(e.message || e) });
+  }
+});
+
+
 
 const cron = require('node-cron');
 
