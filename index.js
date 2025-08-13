@@ -264,7 +264,7 @@ async function applySenderAndSignature(req, res, next) {
 // ===============================
 app.post('/create-mandat', async (req, res) => {
   const {
-    enseigne,            // <-- on attend "enseigne" au lieu de nom/prenom
+    nomMagasin, // <-- source principale
     email,
     adresse,
     ville,
@@ -275,17 +275,22 @@ app.post('/create-mandat', async (req, res) => {
     telephone
   } = req.body;
 
+  // On prend nomMagasin sinon compatibilité, mais on refuse si vide
+  const enseigne = (nomMagasin || req.body.enseigne || req.body.nom || '').trim();
+  if (!enseigne) {
+    return res.status(400).json({ error: 'Le nom du magasin (enseigne) est obligatoire.' });
+  }
+
   try {
     const session_token = uuidv4();
 
-    // Données client pré-remplies pour GoCardless
     const customerData = {
       email,
-      company_name: enseigne || 'Magasin', // <-- nom d'entreprise = enseigne
+      company_name: enseigne, // ✅ plus de "Magasin" par défaut
       address_line1: adresse,
       city: ville,
       postal_code: codePostal,
-      country_code: (pays || 'FR').toUpperCase(),
+      country_code: pays || 'FR',
     };
 
     const response = await fetch(`${GO_CARDLESS_API_BASE}/redirect_flows`, {
@@ -301,7 +306,7 @@ app.post('/create-mandat', async (req, res) => {
           session_token,
           success_redirect_url: `https://opticom-sms-server.onrender.com/validation-mandat?session_token=${session_token}`,
           prefilled_customer: customerData,
-          metadata: { formuleId, siret, telephone, enseigne } // <-- on garde l'enseigne aussi en metadata
+          metadata: { formuleId, siret, telephone, enseigne }
         }
       })
     });
@@ -312,14 +317,14 @@ app.post('/create-mandat', async (req, res) => {
       return res.status(500).json({ error: 'Erreur GoCardless. Vérifiez vos informations.' });
     }
 
-    // On garde les infos utiles en session (plus de nom/prenom)
+    // On stocke toutes les infos nécessaires
     sessionTokenMap.set(session_token, {
-      enseigne: enseigne || 'Magasin',
+      enseigne,
       email,
       adresse,
       ville,
       codePostal,
-      pays: (pays || 'FR').toUpperCase(),
+      pays,
       formuleId,
       siret,
       telephone
@@ -333,6 +338,8 @@ app.post('/create-mandat', async (req, res) => {
 });
 
 
+
+
 app.get('/validation-mandat', async (req, res) => {
   const redirectFlowId = req.query.redirect_flow_id;
   const sessionToken   = req.query.session_token;
@@ -340,7 +347,6 @@ app.get('/validation-mandat', async (req, res) => {
     return res.status(400).send('Paramètre manquant ou session expirée.');
   }
 
-  // petite util pour normaliser l’émetteur (3..11 alphanum)
   const normalizeSender = (raw = 'OptiCOM') => {
     let s = String(raw).toUpperCase().replace(/[^A-Z0-9]/g, '');
     if (s.length < 3) s = 'OPTICOM';
@@ -364,9 +370,12 @@ app.get('/validation-mandat', async (req, res) => {
     const customerId = flow.links.customer;
     const mandateId  = flow.links.mandate;
 
-    // 2) Récupère les infos mises en session dans /create-mandat (avec enseigne)
+    // 2) Récupère les infos mises en session dans /create-mandat
     const opt = sessionTokenMap.get(sessionToken);
     if (!opt) return res.status(400).send('Données opticien manquantes ou session expirée.');
+
+    // 🟢 On prend en priorité nomMagasin si dispo
+    const enseigne = opt.nomMagasin || opt.enseigne || 'Opticien sans nom';
 
     const selectedFormule = formulas.find(f => f.id === opt.formuleId) || { name: 'Formule inconnue', credits: 0 };
     const abonnement = selectedFormule.name;
@@ -374,22 +383,20 @@ app.get('/validation-mandat', async (req, res) => {
 
     const licenceKey = uuidv4();
 
-    // libellé expéditeur par défaut = enseigne normalisée
-    const libelleExpediteur = normalizeSender(opt.enseigne || 'OptiCOM');
+    const libelleExpediteur = normalizeSender(enseigne);
 
-    // 3) Construit la licence (plus de nom/prénom côté opticien)
+    // 3) Construit la licence
     const newLicence = {
       id: uuidv4(),
       licence: licenceKey,
       dateCreation: new Date().toISOString(),
       abonnement,
       credits,
-      libelleExpediteur, // <-- stocké dès la création
+      libelleExpediteur,
       opticien: {
         id: 'opt-' + Math.random().toString(36).slice(2, 10),
-        enseigne: opt.enseigne,   // source de vérité
-        // nom conservé pour compat descendante du front (peut être retiré plus tard)
-        nom: opt.enseigne,
+        enseigne, // 🟢 ici toujours le vrai nom magasin
+        nom: enseigne,
         email: opt.email,
         adresse: opt.adresse,
         ville: opt.ville,
@@ -402,7 +409,7 @@ app.get('/validation-mandat', async (req, res) => {
       customerId
     };
 
-    // 4) Sauvegarde JSONBin (gère array OU objet)
+    // 4) Sauvegarde JSONBin
     const binId = must(process.env.JSONBIN_BIN_ID, 'JSONBIN_BIN_ID');
     const apiKey = must(process.env.JSONBIN_API_KEY, 'JSONBIN_API_KEY');
 
@@ -414,7 +421,6 @@ app.get('/validation-mandat', async (req, res) => {
     const list   = Array.isArray(record) ? record : (record ? [record] : []);
     list.push(newLicence);
 
-    // Si le bin contenait un objet unique, on remet un objet; sinon on remet la liste
     const bodyToPut = Array.isArray(record) ? list : newLicence;
 
     await axios.put(`https://api.jsonbin.io/v3/b/${binId}`, bodyToPut, {
@@ -425,15 +431,12 @@ app.get('/validation-mandat', async (req, res) => {
       }
     });
 
-    // 5) Nettoie la session
     sessionTokenMap.delete(sessionToken);
 
-    // 6) Si on veut du JSON
     if (req.headers.accept?.includes('application/json')) {
       return res.json(newLicence);
     }
 
-    // 7) Page HTML avec bouton "Copier"
     res.send(`
       <html>
         <head>
@@ -479,6 +482,7 @@ app.get('/validation-mandat', async (req, res) => {
     res.status(500).send('Erreur lors de la validation du mandat.');
   }
 });
+
 
 
 // ============================
