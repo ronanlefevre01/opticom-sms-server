@@ -78,6 +78,19 @@ app.use('/webhook-stripe', express.raw({ type: 'application/json' }));
 app.use(cookieParser());
 app.use(express.static('public'));
 
+// ... ton code existant (require('express'), app.use(express.json()), etc.)
+
+const purgeRoutes = require('./routes/purge.routes');
+const { schedulePurge } = require('./services/purgeService');
+
+// routes
+app.use('/api', purgeRoutes);
+
+// CRON quotidien à 03:00 Europe/Paris
+schedulePurge();
+
+// ... ton code existant (app.listen, module.exports, etc.)
+
 // --- Ping ---
 app.get('/', (_, res) => res.send('✅ Serveur OptiCOM en ligne'));
 
