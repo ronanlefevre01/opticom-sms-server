@@ -1,24 +1,34 @@
 name: Daily Purge
 
 on:
-  workflow_dispatch:          # lancer manuellement depuis l’onglet Actions
+  workflow_dispatch:
   schedule:
-    - cron: '5 1 * * *'      # 01:05 UTC ≈ 03:05 Paris (été)
-    - cron: '5 2 * * *'      # 02:05 UTC ≈ 03:05 Paris (hiver)
+    - cron: '5 1 * * *'   # 01:05 UTC ≈ 03:05 Paris (été)
+    - cron: '5 2 * * *'   # 02:05 UTC ≈ 03:05 Paris (hiver)
 
 jobs:
   call-purge:
     runs-on: ubuntu-latest
+    # <- on accepte Secrets OU Variables (au cas où)
+    env:
+      PUBLIC_URL: ${{ secrets.PUBLIC_URL || vars.PUBLIC_URL }}
+      ADMIN_UPLOAD_TOKEN: ${{ secrets.ADMIN_UPLOAD_TOKEN || vars.ADMIN_UPLOAD_TOKEN }}
     steps:
-      - name: Call /api/internal/purge
-        env:
-          PUBLIC_URL: ${{ secrets.PUBLIC_URL }}
-          ADMIN_UPLOAD_TOKEN: ${{ secrets.ADMIN_UPLOAD_TOKEN }}
+      - name: Validate env
         run: |
           set -euo pipefail
-          echo "POST $PUBLIC_URL/api/internal/purge"
+          echo "::add-mask::$ADMIN_UPLOAD_TOKEN"
+          if [ -z "${PUBLIC_URL:-}" ]; then echo "❌ PUBLIC_URL is empty"; exit 1; fi
+          if ! echo "$PUBLIC_URL" | grep -Eq '^https?://'; then
+            echo "❌ PUBLIC_URL must start with http(s):// (got: $PUBLIC_URL)"; exit 1;
+          fi
+          echo "Will call: ${PUBLIC_URL%/}/api/internal/purge"
+
+      - name: Call /api/internal/purge
+        run: |
+          set -euo pipefail
           http_code=$(curl -sS -w "%{http_code}" -o response.json \
-            -X POST "$PUBLIC_URL/api/internal/purge" \
+            -X POST "${PUBLIC_URL%/}/api/internal/purge" \
             -H "Authorization: Bearer $ADMIN_UPLOAD_TOKEN")
           echo "Status: $http_code"
           cat response.json || true
