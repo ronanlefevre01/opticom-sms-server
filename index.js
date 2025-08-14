@@ -645,9 +645,7 @@ function sha256Hex(s) {
 }
 
 // numéro E.164 « +33… » et version normalisée sans non-chiffres pour clé RL/optout
-function toFRNumber(raw = '') {
-  return String(raw).replace(/[^\d+]/g, '').replace(/^0/, '+33');
-}
+
 function normalizeFR(msisdn='') {
   return toFRNumber(msisdn).replace(/\D/g,'');
 }
@@ -874,9 +872,14 @@ app.post('/send-promotional', applySenderAndSignature, async (req, res) => {
     lastSent.set(rlKey, Date.now());
 
     const { sender, signature } = req.smsContext;
-    const stopLink = buildUnsubLink(licence.id, numero);
-    const baseText = buildFinalMessage(message || '', signature);
-    const finalMessage = `${baseText}\nSTOP : ${stopLink}`;
+    const baseText = buildFinalMessage(message, signature);
+
+// France (prospection, sender alpha) : STOP au 36111 obligatoire.
+function ensureStopMention(text) {
+  return /stop\s+au\s+36111/i.test(text) ? text : `${text}\nSTOP au 36111`;
+}
+const finalMessage = ensureStopMention(baseText);
+
 
     const params = new URLSearchParams();
     params.append('pseudo', process.env.SMSMODE_LOGIN);
@@ -1031,38 +1034,6 @@ app.post('/achat-credits-gocardless', async (req, res) => {
   }
 });
 
-app.post('/resiliation-abonnement', async (req, res) => {
-  try {
-    const { email, licenceId } = req.body || {};
-    if (!email && !licenceId) {
-      return res.status(400).json({ success: false, error: 'EMAIL_OU_LICENCE_ID_REQUIS' });
-    }
-
-    const { list, rawRecord } = await jsonbinGetAll();
-
-    let { idx, licence } =
-      licenceId
-        ? findLicenceIndex(list, l => String(l.id) === String(licenceId))
-        : findLicenceIndex(list, l => String(l.opticien?.email).toLowerCase() === String(email).toLowerCase());
-
-    if (idx === -1) return res.status(404).json({ success: false, error: 'LICENCE_INTROUVABLE' });
-
-    // On prend la prochaine échéance connue pour la date de fin
-    const dateResiliation =
-      licence.renouvellement || licence.next_payment_date || new Date().toISOString().slice(0, 10);
-
-    licence.resiliationDemandee = true;
-    licence.dateResiliation = dateResiliation;
-
-    const bodyToPut = Array.isArray(rawRecord) ? (list[idx] = licence, list) : licence;
-    await jsonbinPutAll(bodyToPut);
-
-    return res.json({ success: true, dateResiliation });
-  } catch (e) {
-    console.error('❌ /resiliation-abonnement error:', e);
-    return res.status(500).json({ success: false, error: 'SERVER_ERROR' });
-  }
-});
 
 
 
