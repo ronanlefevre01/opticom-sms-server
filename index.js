@@ -727,6 +727,96 @@ app.get('/unsubscribe', async (req, res) => {
   }
 });
 
+// --- Admin Opt-out: export CSV & ajout manuel ---
+// Protégées par le même jeton que l’upload de facture (ADMIN_UPLOAD_TOKEN)
+
+app.get('/api/optouts/export', requireAdminToken, async (req, res) => {
+  try {
+    const { licenceId } = req.query || {};
+    if (!licenceId) return res.status(400).send('licenceId requis');
+
+    const { list } = await jsonbinGetAll();
+    const { idx, licence } = findLicenceIndex(list, l => String(l.id) === String(licenceId));
+    if (idx === -1) return res.status(404).send('Licence introuvable');
+
+    const items = Array.isArray(licence.optOuts) ? licence.optOuts : [];
+    const csv = ['phone_e164'].concat(items).join('\n');
+
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="optouts-${licenceId}.csv"`);
+    res.send(csv);
+  } catch (e) {
+    console.error('export optouts error', e);
+    res.status(500).send('SERVER_ERROR');
+  }
+});
+
+app.post('/api/optouts/add', requireAdminToken, async (req, res) => {
+  try {
+    const { licenceId, phoneNumber } = req.body || {};
+    if (!licenceId || !phoneNumber) {
+      return res.status(400).json({ ok:false, error:'PARAMS' });
+    }
+
+    const phone = toFRNumber(phoneNumber); // normalise en +33...
+    const { list, rawRecord } = await jsonbinGetAll();
+    const { idx, licence } = findLicenceIndex(list, l => String(l.id) === String(licenceId));
+    if (idx === -1) return res.status(404).json({ ok:false, error:'NOT_FOUND' });
+
+    const set = new Set([ ...(licence.optOuts || []) ]);
+    set.add(phone);
+    licence.optOuts = Array.from(set);
+
+    await jsonbinPutAll(Array.isArray(rawRecord) ? (list[idx] = licence, list) : licence);
+    res.json({ ok:true });
+  } catch (e) {
+    console.error('optouts add error', e);
+    res.status(500).json({ ok:false, error:'SERVER_ERROR' });
+  }
+});
+
+
+// =======================
+//   Consentement marketing
+// =======================
+app.post('/consent', async (req, res) => {
+  try {
+    const { licenceId, phoneNumber, source = 'app' } = req.body || {};
+    if (!licenceId || !phoneNumber) {
+      return res.status(400).json({ success:false, error:'LICENCE_ID_ET_NUMERO_REQUIS' });
+    }
+    const phone = toFRNumber(phoneNumber);
+    const hash = sha256Hex(phone);
+
+    const { list, rawRecord } = await jsonbinGetAll();
+    const { idx, licence } = findLicenceIndex(list, l => String(l.id) === String(licenceId));
+    if (idx === -1) return res.status(404).json({ success:false, error:'LICENCE_INTROUVABLE' });
+
+    // tableau "consents" (pour check rapide) + "consentsLog" (preuve détaillée)
+    const set = new Set([ ...(licence.consents || []) ]);
+    set.add(phone);
+    licence.consents = Array.from(set);
+
+    const log = Array.isArray(licence.consentsLog) ? licence.consentsLog : [];
+    log.push({
+      at: new Date().toISOString(),
+      phone,
+      hash,
+      source,
+      ip: (req.headers['x-forwarded-for']?.toString().split(',')[0] || req.ip || '').trim(),
+      userAgent: req.get('user-agent') || ''
+    });
+    licence.consentsLog = log.slice(-5000); // borne raisonnable
+
+    const bodyToPut = Array.isArray(rawRecord) ? (list[idx] = licence, list) : licence;
+    await jsonbinPutAll(bodyToPut);
+
+    return res.json({ success:true });
+  } catch (e) {
+    console.error('❌ /consent error:', e);
+    return res.status(500).json({ success:false, error:'SERVER_ERROR' });
+  }
+});
 
 
 
