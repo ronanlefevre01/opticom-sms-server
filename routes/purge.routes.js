@@ -73,4 +73,21 @@ router.get('/selftest/:key', async (req, res) => {
   }
 });
 
+// --- DEBUG TEMP : comprendre les 403 sans exposer la clé (à SUPPRIMER après) ---
+router.get('/purge-debug/:key', async (req, res) => {
+  const secret = (process.env.PURGE_WEBHOOK_KEY || '').trim();
+  const providedRaw = req.params.key || '';
+  const provided = decodeURIComponent(providedRaw.trim().replace(/\/+$/, ''));
+  res.json({
+    hasSecret: !!secret,
+    secretLen: secret.length,
+    providedRaw,
+    providedLen: provided.length,
+    sameLen: provided.length === secret.length,
+    equal: secret && provided.length === secret.length &&
+           require('crypto').timingSafeEqual(Buffer.from(provided), Buffer.from(secret))
+  });
+});
+
+
 module.exports = router;
