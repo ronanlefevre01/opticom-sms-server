@@ -1,0 +1,25 @@
+name: Daily Purge
+
+on:
+  workflow_dispatch:          # lancer manuellement depuis l’onglet Actions
+  schedule:
+    - cron: '5 1 * * *'      # 01:05 UTC ≈ 03:05 Paris (été)
+    - cron: '5 2 * * *'      # 02:05 UTC ≈ 03:05 Paris (hiver)
+
+jobs:
+  call-purge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call /api/internal/purge
+        env:
+          PUBLIC_URL: ${{ secrets.PUBLIC_URL }}
+          ADMIN_UPLOAD_TOKEN: ${{ secrets.ADMIN_UPLOAD_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "POST $PUBLIC_URL/api/internal/purge"
+          http_code=$(curl -sS -w "%{http_code}" -o response.json \
+            -X POST "$PUBLIC_URL/api/internal/purge" \
+            -H "Authorization: Bearer $ADMIN_UPLOAD_TOKEN")
+          echo "Status: $http_code"
+          cat response.json || true
+          test "$http_code" -ge 200 -a "$http_code" -lt 300
