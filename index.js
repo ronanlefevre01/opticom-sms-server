@@ -12,6 +12,21 @@ const goCardless = require('gocardless-nodejs');
 const cookieParser = require('cookie-parser');
 const { URLSearchParams } = require('url');
 const multer = require('multer'); // ← AJOUT
+const cryptoNode = require('crypto'); // si pas déjà importé
+
+// ---- CGV (version + texte brut Markdown + hash) ----
+const CGV_VERSION = process.env.CGV_VERSION || '2025-08-14';
+const CGV_FILE = path.join(__dirname, 'public', 'legal', `cgv-${CGV_VERSION}.md`);
+
+let CGV_TEXT_HASH = process.env.CGV_TEXT_HASH || '';
+try {
+  const cgvTxt = fs.readFileSync(CGV_FILE, 'utf8');
+  CGV_TEXT_HASH = cryptoNode.createHash('sha256').update(cgvTxt).digest('hex');
+  console.log('✅ CGV loaded:', CGV_FILE, 'hash=', CGV_TEXT_HASH);
+} catch (e) {
+  console.warn('⚠️ CGV file not found. You can still use env CGV_TEXT_HASH if provided.');
+}
+
 
 
 // fetch (ESM compat)
@@ -241,6 +256,86 @@ app.post('/licence/signature', async (req, res) => {
     res.status(500).json({ success: false, error: 'SERVER_ERROR' });
   }
 });
+
+// 1) Statut d’acceptation CGV pour une licence
+app.get('/licence/cgv-status', async (req, res) => {
+  try {
+    const { licenceId } = req.query || {};
+    if (!licenceId) return res.status(400).json({ error: 'licenceId requis' });
+
+    const { list } = await jsonbinGetAll();
+    const { idx, licence } = findLicenceIndex(
+      list,
+      l => String(l.licence) === String(licenceId) || String(l.id) === String(licenceId)
+    );
+    if (idx === -1) return res.status(404).json({ error: 'LICENCE_INTROUVABLE' });
+
+    const accepted = !!licence.cgv && licence.cgv.version === CGV_VERSION && !!licence.cgv.acceptedAt;
+    const absoluteUrl = `${req.protocol}://${req.get('host')}/legal/cgv-${CGV_VERSION}.md`;
+
+    res.json({
+      licenceId,
+      currentVersion: CGV_VERSION,
+      accepted,
+      acceptedVersion: licence.cgv?.version || null,
+      acceptedAt: licence.cgv?.acceptedAt || null,
+      textUrl: absoluteUrl,
+      serverTextHash: CGV_TEXT_HASH || null,
+    });
+  } catch (e) {
+    console.error('❌ /licence/cgv-status', e);
+    res.status(500).json({ error: 'SERVER_ERROR' });
+  }
+});
+
+// 2) Enregistrement de l’acceptation CGV (preuve)
+app.post('/licence/cgv-accept', async (req, res) => {
+  try {
+    const { licenceId, version, textHash } = req.body || {};
+    if (!licenceId || !version || !textHash) {
+      return res.status(400).json({ error: 'licenceId, version et textHash requis' });
+    }
+    if (version !== CGV_VERSION) {
+      return res.status(409).json({ error: 'VERSION_MISMATCH', currentVersion: CGV_VERSION });
+    }
+    if (CGV_TEXT_HASH && textHash !== CGV_TEXT_HASH) {
+      return res.status(409).json({ error: 'TEXT_MISMATCH' });
+    }
+
+    const { list, rawRecord } = await jsonbinGetAll();
+    const { idx, licence } = findLicenceIndex(
+      list,
+      l => String(l.licence) === String(licenceId) || String(l.id) === String(licenceId)
+    );
+    if (idx === -1) return res.status(404).json({ error: 'LICENCE_INTROUVABLE' });
+
+    const ua = req.get('user-agent') || '';
+    const ip = (req.headers['x-forwarded-for']?.toString().split(',')[0] || req.ip || '').trim();
+    const now = new Date().toISOString();
+
+    licence.cgv = {
+      accepted: true,
+      version: CGV_VERSION,
+      acceptedAt: now,
+      ip,
+      userAgent: ua,
+      textHash,
+      textUrl: `/legal/cgv-${CGV_VERSION}.md`,
+      method: 'modal_click',
+      locale: 'fr-FR'
+    };
+
+    const bodyToPut = Array.isArray(rawRecord) ? (list[idx] = licence, list) : licence;
+    await jsonbinPutAll(bodyToPut);
+
+    console.log('AUDIT CGV_ACCEPT', { licenceId, version: CGV_VERSION, ip, ua, at: now });
+    res.json({ ok: true, acceptedAt: now, version: CGV_VERSION });
+  } catch (e) {
+    console.error('❌ /licence/cgv-accept', e);
+    res.status(500).json({ error: 'SERVER_ERROR' });
+  }
+});
+
 
 
 
