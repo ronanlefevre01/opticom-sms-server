@@ -837,50 +837,66 @@ app.post('/send-transactional', applySenderAndSignature, async (req, res) => {
 
 // Alias promotionnel (même décrémentation, seul endpoint SMSMode change si besoin)
 app.post('/send-promotional', applySenderAndSignature, async (req, res) => {
-  const { phoneNumber, message, licenceId, opticienId } = req.body || {};
+  const { phoneNumber, message, licenceId, opticienId, marketingConsent } = req.body || {};
+
   if (!phoneNumber || (!licenceId && !opticienId)) {
-    return res.status(400).json({ success:false, error:'Champs manquants.' });
+    return res.status(400).json({ success: false, error: 'Champs manquants.' });
   }
   if (isQuietHours(new Date())) {
-    return res.status(403).json({ success:false, error:'ENVOI_INTERDIT_HORAIRES' });
+    return res.status(403).json({ success: false, error: 'ENVOI_INTERDIT_HORAIRES' });
   }
 
   try {
     const { list, rawRecord } = await jsonbinGetAll();
     const found = licenceId
-      ? findLicenceIndex(list, l => String(l.id) === String(licenceId))
-      : findLicenceIndex(list, l => String(l.opticien?.id) === String(opticienId));
-    if (found.idx === -1) return res.status(403).json({ success:false, error:'Licence introuvable.' });
+      ? findLicenceIndex(list, (l) => String(l.id) === String(licenceId))
+      : findLicenceIndex(list, (l) => String(l.opticien?.id) === String(opticienId));
+
+    if (found.idx === -1) {
+      return res.status(403).json({ success: false, error: 'Licence introuvable.' });
+    }
     const licence = found.licence;
 
-    // consentement marketing requis
-    if (!hasMarketingConsent(licence)) {
-      return res.status(403).json({ success:false, error:'CONSENTEMENT_MARKETING_ABSENT' });
-    }
-
+    // Numéro au format FR/E.164
     const numero = toFRNumber(phoneNumber);
-    if (isOptedOut(licence, numero)) {
-      return res.status(403).json({ success:false, error:'DESTINATAIRE_DESINSCRIT' });
+
+    // 🛑 Consentement marketing requis (body ou liste serveur)
+    const hasConsent =
+      marketingConsent === true ||
+      (Array.isArray(licence.consents) && licence.consents.includes(numero)) ||
+      licence.marketingConsentGlobal === true;
+
+    if (!hasConsent) {
+      return res.status(403).json({ success: false, error: 'CONSENTEMENT_MARKETING_ABSENT' });
     }
 
-    // ⏱️ anti-spam 15s par (licence, numéro)
-    const rlKey = `${licence.id}:${normalizeFR(numero)}`;
+    // 📴 Respect du STOP / désinscription déjà faite
+    if (isOptedOut(licence, numero)) {
+      return res.status(403).json({ success: false, error: 'DESTINATAIRE_DESINSCRIT' });
+    }
+
+    // ⏱️ anti-spam : 15s entre 2 envois (licence, numéro)
+    const rlKey = `${licence.id}:${numero}`;
     const last = lastSent.get(rlKey) || 0;
     if (Date.now() - last < MIN_INTERVAL_MS) {
-      return res.status(429).json({ success:false, error:'Trop rapproché, réessayez dans quelques secondes.' });
+      return res
+        .status(429)
+        .json({ success: false, error: 'Trop rapproché, réessayez dans quelques secondes.' });
     }
     lastSent.set(rlKey, Date.now());
 
     const { sender, signature } = req.smsContext;
-    const baseText = buildFinalMessage(message, signature);
 
-// France (prospection, sender alpha) : STOP au 36111 obligatoire.
-function ensureStopMention(text) {
-  return /stop\s+au\s+36111/i.test(text) ? text : `${text}\nSTOP au 36111`;
-}
-const finalMessage = ensureStopMention(baseText);
+    // ✍️ Ajoute la signature si absente
+    const baseText = buildFinalMessage(message || '', signature || '');
 
+    // 🇫🇷 Prospection FR : STOP au 36111 obligatoire (sender alpha)
+    function ensureStopMention(text) {
+      return /stop\s+au\s+36111/i.test(text) ? text : `${text}\nSTOP au 36111`;
+    }
+    const finalMessage = ensureStopMention(baseText);
 
+    // Envoi SMSMode
     const params = new URLSearchParams();
     params.append('pseudo', process.env.SMSMODE_LOGIN);
     params.append('pass', process.env.SMSMODE_PASSWORD);
@@ -892,8 +908,8 @@ const finalMessage = ensureStopMention(baseText);
     params.append('emetteur', sender);
 
     const smsResp = await fetch('https://api.smsmode.com/http/1.6/sendSMS.do', {
-      method:'POST',
-      headers:{ 'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8' },
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
       body: params.toString(),
     });
     const smsText = await smsResp.text();
@@ -901,14 +917,20 @@ const finalMessage = ensureStopMention(baseText);
     const smsHasError =
       !smsResp.ok || /^32\s*\|/i.test(smsText) || /^35\s*\|/i.test(smsText) || /\berror\b/i.test(smsText);
     if (smsHasError) {
-      return res.status(502).json({ success:false, error:`Erreur SMSMode: ${smsText}` });
+      return res.status(502).json({ success: false, error: `Erreur SMSMode: ${smsText}` });
     }
 
+    // Décrément crédits si ≠ Illimitée
     if (licence.abonnement !== 'Illimitée') {
       licence.credits = Math.max(0, Number(licence.credits || 0) - 1);
     }
+
+    // Log + persistance JSONBin
     await appendSmsLogAndPersist({
-      list, rawRecord, idx: found.idx, licence,
+      list,
+      rawRecord,
+      idx: found.idx,
+      licence,
       entry: {
         date: new Date().toISOString(),
         type: 'marketing',
@@ -917,16 +939,23 @@ const finalMessage = ensureStopMention(baseText);
         textHash: sha256Hex(finalMessage),
         provider: 'smsmode',
         bytes: Buffer.byteLength(finalMessage, 'utf8'),
-        mois: ymKey(new Date())
-      }
+        mois: ymKey(new Date()),
+      },
     });
 
-    return res.json({ success:true, licenceId: licence.id, sender, message: finalMessage, credits: licence.credits });
+    return res.json({
+      success: true,
+      licenceId: licence.id,
+      sender,
+      message: finalMessage,
+      credits: licence.credits,
+    });
   } catch (err) {
     console.error('Erreur /send-promotional:', err);
-    res.status(500).json({ success:false, error:String(err.message || err) });
+    res.status(500).json({ success: false, error: String(err.message || err) });
   }
 });
+
 
 
 
