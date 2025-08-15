@@ -13,6 +13,10 @@ const cookieParser = require('cookie-parser');
 const { URLSearchParams } = require('url');
 const multer = require('multer'); // ← AJOUT
 const cryptoNode = require('crypto'); // si pas déjà importé
+const licenceRoutes = require('./routes/licence.routes');
+
+app.use('/api', licenceRoutes);
+
 
 // ---- CGV (version + texte brut Markdown + hash) ----
 const CGV_VERSION = process.env.CGV_VERSION || '2025-08-14';
