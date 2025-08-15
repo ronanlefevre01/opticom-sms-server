@@ -15,7 +15,7 @@ const multer = require('multer'); // ← AJOUT
 const cryptoNode = require('crypto'); // si pas déjà importé
 const licenceRoutes = require('./routes/licence.routes');
 
-app.use('/api', licenceRoutes);
+
 
 
 // ---- CGV (version + texte brut Markdown + hash) ----
@@ -49,6 +49,7 @@ const goCardlessClient = goCardless(
 
 const sessionTokenMap = new Map();
 
+
 // --- Formules ---
 const formulas = [
   { id: 'starter', name: 'Starter', credits: 100 },
@@ -81,6 +82,7 @@ app.use(bodyParser.json());
 app.use('/webhook-stripe', express.raw({ type: 'application/json' }));
 app.use(cookieParser());
 app.use(express.static('public'));
+app.use('/api', licenceRoutes);
 
 // ... ton code existant (require('express'), app.use(express.json()), etc.)
 
