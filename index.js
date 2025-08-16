@@ -15,6 +15,10 @@ const multer = require('multer'); // ← AJOUT
 const cryptoNode = require('crypto'); // si pas déjà importé
 const licenceRoutes = require('./routes/licence.routes');
 
+// --- JSONBin config (une seule clé, deux noms possibles côté env) ---
+const JSONBIN_BIN_ID = process.env.JSONBIN_BIN_ID;
+const JSONBIN_KEY = process.env.JSONBIN_MASTER_KEY || process.env.JSONBIN_API_KEY; // accepte l’un ou l’autre
+
 
 
 
@@ -138,17 +142,13 @@ app.post('/api/upload-facture', requireAdminToken, upload.single('pdf'), (req, r
 // =======================
 //   JSONBIN HELPERS
 // =======================
-const must = (v, name) => {
-  if (!v) throw new Error(`${name} manquant.`);
-  return v;
-};
+const must = (v, name) => { if (!v) throw new Error(`${name} manquant.`); return v; };
 
 async function jsonbinGetAll() {
-  const binId = must(process.env.JSONBIN_BIN_ID, 'JSONBIN_BIN_ID');
-  const headers = {
-    'X-Bin-Meta': 'false',
-    ...(process.env.JSONBIN_API_KEY ? { 'X-Master-Key': process.env.JSONBIN_API_KEY } : {}),
-  };
+  const binId = must(JSONBIN_BIN_ID, 'JSONBIN_BIN_ID');
+  const headers = { 'X-Bin-Meta': 'false' };
+  if (JSONBIN_KEY) headers['X-Master-Key'] = JSONBIN_KEY;
+
   const r = await fetch(`https://api.jsonbin.io/v3/b/${binId}/latest`, { headers });
   if (!r.ok) {
     const t = await r.text().catch(() => '');
@@ -161,12 +161,10 @@ async function jsonbinGetAll() {
 }
 
 async function jsonbinPutAll(body) {
-  const binId = must(process.env.JSONBIN_BIN_ID, 'JSONBIN_BIN_ID');
-  const headers = {
-    'Content-Type': 'application/json',
-    ...(process.env.JSONBIN_API_KEY ? { 'X-Master-Key': process.env.JSONBIN_API_KEY } : {}),
-    'X-Bin-Versioning': 'false',
-  };
+  const binId = must(JSONBIN_BIN_ID, 'JSONBIN_BIN_ID');
+  const headers = { 'Content-Type': 'application/json', 'X-Bin-Versioning': 'false' };
+  if (JSONBIN_KEY) headers['X-Master-Key'] = JSONBIN_KEY;
+
   const r = await fetch(`https://api.jsonbin.io/v3/b/${binId}`, {
     method: 'PUT',
     headers,
@@ -178,10 +176,6 @@ async function jsonbinPutAll(body) {
   }
 }
 
-function findLicenceIndex(list, predicate) {
-  const idx = list.findIndex(predicate);
-  return { idx, licence: idx >= 0 ? list[idx] : null };
-}
 
 // =======================
 //   Licence update helper
@@ -576,7 +570,8 @@ app.get('/validation-mandat', async (req, res) => {
 
     // 4) Sauvegarde JSONBin
     const binId = must(process.env.JSONBIN_BIN_ID, 'JSONBIN_BIN_ID');
-    const apiKey = must(process.env.JSONBIN_API_KEY, 'JSONBIN_API_KEY');
+    const apiKey = must(JSONBIN_KEY, 'JSONBIN_KEY');
+
 
     const getResponse = await axios.get(`https://api.jsonbin.io/v3/b/${binId}/latest`, {
       headers: { 'X-Master-Key': apiKey, 'X-Bin-Meta': 'false' }
@@ -938,12 +933,6 @@ app.post('/send-sms', applySenderAndSignature, sendSmsTransactional);
 app.post('/send-transactional', applySenderAndSignature, sendSmsTransactional);
 
 
-// Alias transactionnel
-app.post('/send-transactional', applySenderAndSignature, async (req, res) => {
-  req.body = { ...req.body, licenceId: req.body.licenceId, opticienId: req.body.opticienId };
-  return app._router.handle(req, res, () => {}, 'post', '/send-sms');
-});
-
 // Alias promotionnel (même décrémentation, seul endpoint SMSMode change si besoin)
 app.post('/send-promotional', applySenderAndSignature, async (req, res) => {
   const { phoneNumber, message, licenceId, opticienId, marketingConsent } = req.body || {};
@@ -1272,6 +1261,56 @@ app.post('/webhook-stripe', express.raw({ type: 'application/json' }), async (re
 
   res.status(200).send('OK');
 });
+
+// ---- Licence lookup (clé) ----
+app.get('/licence/by-key', async (req, res) => {
+  try {
+    const cle = String(req.query.cle || '').trim();
+    if (!cle) return res.status(400).json({ error: "Paramètre 'cle' requis" });
+
+    const { list } = await jsonbinGetAll();
+    const found = list.find(l => {
+      const k = String(l?.licence ?? l?.cle ?? l?.key ?? '').trim();
+      return k === cle; // casse respectée (tu m’as dit qu’il y a des minuscules)
+    });
+    if (!found) return res.status(404).json({ error: 'Licence introuvable' });
+
+    res.set('Cache-Control', 'no-store');
+    return res.json({ licence: found });
+  } catch (e) {
+    console.error('GET /licence/by-key error:', e);
+    return res.status(500).json({ error: 'SERVER_ERROR' });
+  }
+});
+
+// ---- Licence lookup (id stable), utile à d’autres écrans
+app.get('/licence/by-id', async (req, res) => {
+  try {
+    const id = String(req.query.id || '').trim();
+    if (!id) return res.status(400).json({ error: "Paramètre 'id' requis" });
+
+    const { list } = await jsonbinGetAll();
+    const found = list.find(l => String(l?.id ?? l?.opticien?.id ?? '').trim() === id);
+    if (!found) return res.status(404).json({ error: 'Licence introuvable' });
+
+    res.set('Cache-Control', 'no-store');
+    return res.json({ licence: found });
+  } catch (e) {
+    console.error('GET /licence/by-id error:', e);
+    return res.status(500).json({ error: 'SERVER_ERROR' });
+  }
+});
+
+// ---- Compat anciens clients (logs montrent /licence-by-key et /licence)
+app.get('/licence-by-key', (req, res) => {
+  const cle = String(req.query.cle || '');
+  return res.redirect(307, `/licence/by-key?cle=${encodeURIComponent(cle)}`);
+});
+app.get('/licence', (req, res) => {
+  const cle = String(req.query.cle || '');
+  return res.redirect(307, `/licence/by-key?cle=${encodeURIComponent(cle)}`);
+});
+
 
 // =======================
 //   Facture PDF (JSONBin)
