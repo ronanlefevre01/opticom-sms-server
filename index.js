@@ -1549,6 +1549,53 @@ updated = true;
   }
 });
 
+// =======================
+//   Licence lookup (GET)
+// =======================
+function normKey(s = '') {
+  // comparaison tolérante: supprime espaces & tirets, insensible à la casse
+  return String(s).replace(/[\s-]/g, '').toUpperCase();
+}
+
+/**
+ * Renvoie une licence au format { licence: {...} }
+ * Recherche par clé (licence/cel/key) ou par id si fourni.
+ */
+async function findLicence({ cle, id }) {
+  const { list } = await jsonbinGetAll();
+  if (id) {
+    const byId = list.find((l) => String(l.id).toLowerCase() === String(id).toLowerCase());
+    if (byId) return byId;
+  }
+  if (cle) {
+    const q = normKey(cle);
+    const byKey = list.find((l) => normKey(l.licence || l.cle || l.key || '') === q);
+    if (byKey) return byKey;
+  }
+  return null;
+}
+
+// Routes "officielles" + alias rétrocompat
+app.get(['/api/licence/by-key', '/licence/by-key', '/licence-by-key', '/api/licence', '/licence'], async (req, res) => {
+  try {
+    const cle = req.query.cle || req.query.key || req.query.k;
+    const id  = req.query.id; // optionnel
+    if (!cle && !id) return res.status(400).json({ error: 'Paramètre cle ou id requis' });
+
+    const licence = await findLicence({ cle, id });
+    if (!licence) return res.status(404).json({ error: 'LICENCE_INTROUVABLE' });
+
+    return res.json({ licence });
+  } catch (e) {
+    console.error('❌ /licence/by-key error:', e);
+    return res.status(500).json({ error: 'SERVER_ERROR' });
+  }
+});
+
+// Petit ping JSON brut pour debug local
+app.get('/api/ping', (_, res) => res.json({ ok: true }));
+
+
 
 
 // =======================
