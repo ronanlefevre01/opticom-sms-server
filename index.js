@@ -39,6 +39,7 @@ try {
 const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
 
 const app = express();
+app.set('trust proxy', true); // important derrière Render/NGINX
 const PORT = process.env.PORT || 3001;
 
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
@@ -271,7 +272,9 @@ app.get('/licence/cgv-status', async (req, res) => {
     if (idx === -1) return res.status(404).json({ error: 'LICENCE_INTROUVABLE' });
 
     const accepted = !!licence.cgv && licence.cgv.version === CGV_VERSION && !!licence.cgv.acceptedAt;
-    const absoluteUrl = `${req.protocol}://${req.get('host')}/legal/cgv-${CGV_VERSION}.md`;
+    const scheme = String(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0];
+    const base = process.env.PUBLIC_SERVER_BASE || `${scheme}://${req.get('host')}`;
+    const absoluteUrl = `${base}/legal/cgv-${CGV_VERSION}.md`;
 
     res.json({
       licenceId,
