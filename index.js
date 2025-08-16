@@ -952,6 +952,148 @@ app.post('/send-promotional', applySenderAndSignature, async (req, res) => {
   }
 });
 
+// =======================
+//   SUPPORT / FEEDBACK
+// =======================
+const ADMIN_FEEDBACK_TOKEN = process.env.ADMIN_FEEDBACK_TOKEN || process.env.ADMIN_UPLOAD_TOKEN;
+
+// POST /support/messages  (alias: /api/support/messages)
+// body: { licenceId, subject?, message, email?, platform?, appVersion? }
+app.post(['/support/messages', '/api/support/messages'], async (req, res) => {
+  try {
+    const { licenceId, subject = '', message, email = '', platform = '', appVersion = '' } = req.body || {};
+    if (!licenceId || !message || !String(message).trim()) {
+      return res.status(400).json({ success:false, error:'LICENCE_ID_ET_MESSAGE_REQUIS' });
+    }
+
+    const { list, rawRecord } = await jsonbinGetAll();
+    const { idx, licence } = findLicenceIndex(
+      list,
+      (l) =>
+        String(l.id) === String(licenceId) ||
+        String(l.licence) === String(licenceId) ||
+        String(l.opticien?.id) === String(licenceId)
+    );
+    if (idx === -1 || !licence) {
+      return res.status(404).json({ success:false, error:'LICENCE_INTROUVABLE' });
+    }
+
+    const entry = {
+      id: uuidv4(),
+      date: new Date().toISOString(),
+      licenceId: licence.id,
+      objet: String(subject || '').slice(0, 140),
+      message: String(message || '').slice(0, 4000),
+      email: String(email || '').slice(0, 200),
+      platform: String(platform || '').slice(0, 32),
+      appVersion: String(appVersion || '').slice(0, 32),
+      statut: 'nouveau',
+    };
+
+    licence.feedbackInbox = Array.isArray(licence.feedbackInbox) ? licence.feedbackInbox : [];
+    licence.feedbackInbox.push(entry);
+
+    const bodyToPut = Array.isArray(rawRecord) ? (list[idx] = licence, list) : licence;
+    await jsonbinPutAll(bodyToPut);
+
+    return res.json({ success:true, entry });
+  } catch (e) {
+    console.error('❌ /support/messages (POST) error:', e);
+    return res.status(500).json({ success:false, error:'SERVER_ERROR' });
+  }
+});
+
+// GET /support/messages  (alias: /api/support/messages)
+// header: Authorization: Bearer <ADMIN_FEEDBACK_TOKEN>
+// query optionnelles: status=nouveau|traite|*, q=texte
+app.get(['/support/messages', '/api/support/messages'], async (req, res) => {
+  try {
+    const auth = req.get('authorization') || '';
+    if (!ADMIN_FEEDBACK_TOKEN || auth !== `Bearer ${ADMIN_FEEDBACK_TOKEN}`) {
+      return res.status(401).json({ error:'unauthorized' });
+    }
+    const statusFilter = String(req.query.status || '').toLowerCase();
+    const q = String(req.query.q || '').toLowerCase();
+
+    const { list } = await jsonbinGetAll();
+    const rows = [];
+    for (const lic of list) {
+      const arr = Array.isArray(lic.feedbackInbox) ? lic.feedbackInbox : [];
+      for (const it of arr) {
+        const row = {
+          ...it,
+          licence: lic.licence || lic.id,
+          enseigne: lic.opticien?.enseigne || lic.opticien?.nom || '',
+          emailLicence: lic.opticien?.email || '',
+        };
+        rows.push(row);
+      }
+    }
+
+    let out = rows.sort((a,b) => (a.date < b.date ? 1 : -1));
+    if (statusFilter && statusFilter !== '*' && statusFilter !== 'tous') {
+      out = out.filter(r => (r.statut || '').toLowerCase() === statusFilter);
+    }
+    if (q) {
+      out = out.filter(r =>
+        (r.objet || '').toLowerCase().includes(q) ||
+        (r.message || '').toLowerCase().includes(q) ||
+        (r.email || '').toLowerCase().includes(q) ||
+        (r.enseigne || '').toLowerCase().includes(q) ||
+        String(r.licence || '').toLowerCase().includes(q)
+      );
+    }
+
+    return res.json({ items: out, total: out.length });
+  } catch (e) {
+    console.error('❌ /support/messages (GET) error:', e);
+    return res.status(500).json({ error:'SERVER_ERROR' });
+  }
+});
+
+// POST /support/messages/update (alias: /api/support/messages/update)
+// header: Authorization: Bearer <ADMIN_FEEDBACK_TOKEN>
+// body: { licenceId, id, statut }  // statut: "nouveau" | "traite"
+app.post(['/support/messages/update', '/api/support/messages/update'], async (req, res) => {
+  try {
+    const auth = req.get('authorization') || '';
+    if (!ADMIN_FEEDBACK_TOKEN || auth !== `Bearer ${ADMIN_FEEDBACK_TOKEN}`) {
+      return res.status(401).json({ error:'unauthorized' });
+    }
+    const { licenceId, id, statut } = req.body || {};
+    if (!licenceId || !id || !statut) {
+      return res.status(400).json({ error:'PARAMS' });
+    }
+
+    const { list, rawRecord } = await jsonbinGetAll();
+    const { idx, licence } = findLicenceIndex(
+      list,
+      (l) => String(l.id) === String(licenceId) || String(l.licence) === String(licenceId)
+    );
+    if (idx === -1 || !licence) {
+      return res.status(404).json({ error:'LICENCE_INTROUVABLE' });
+    }
+
+    let changed = false;
+    licence.feedbackInbox = Array.isArray(licence.feedbackInbox) ? licence.feedbackInbox : [];
+    licence.feedbackInbox = licence.feedbackInbox.map((x) => {
+      if (String(x.id) === String(id)) { changed = true; return { ...x, statut }; }
+      return x;
+    });
+
+    if (!changed) return res.status(404).json({ error:'MESSAGE_INTROUVABLE' });
+
+    const bodyToPut = Array.isArray(rawRecord) ? (list[idx] = licence, list) : licence;
+    await jsonbinPutAll(bodyToPut);
+
+    return res.json({ ok:true });
+  } catch (e) {
+    console.error('❌ /support/messages/update error:', e);
+    return res.status(500).json({ error:'SERVER_ERROR' });
+  }
+});
+
+
 // ===================================
 //   Achat de crédits via GoCardless
 // ===================================
