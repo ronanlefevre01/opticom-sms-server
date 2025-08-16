@@ -11,16 +11,16 @@ const PDFDocument = require('pdfkit');
 const goCardless = require('gocardless-nodejs');
 const cookieParser = require('cookie-parser');
 const { URLSearchParams } = require('url');
-const multer = require('multer'); // ← AJOUT
-const cryptoNode = require('crypto'); // si pas déjà importé
+const multer = require('multer');
+const cryptoNode = require('crypto');
+
 const licenceRoutes = require('./routes/licence.routes');
+const purgeRoutes = require('./routes/purge.routes');
+const { schedulePurge } = require('./services/purgeService');
 
 // --- JSONBin config (une seule clé, deux noms possibles côté env) ---
 const JSONBIN_BIN_ID = process.env.JSONBIN_BIN_ID;
 const JSONBIN_KEY = process.env.JSONBIN_MASTER_KEY || process.env.JSONBIN_API_KEY; // accepte l’un ou l’autre
-
-
-
 
 // ---- CGV (version + texte brut Markdown + hash) ----
 const CGV_VERSION = process.env.CGV_VERSION || '2025-08-14';
@@ -34,8 +34,6 @@ try {
 } catch (e) {
   console.warn('⚠️ CGV file not found. You can still use env CGV_TEXT_HASH if provided.');
 }
-
-
 
 // fetch (ESM compat)
 const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
@@ -52,7 +50,6 @@ const goCardlessClient = goCardless(
 );
 
 const sessionTokenMap = new Map();
-
 
 // --- Formules ---
 const formulas = [
@@ -74,11 +71,10 @@ app.use(
     maxAge: '1y',
     setHeaders: (res) => {
       res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
-      res.setHeader('Content-Disposition', 'inline'); // affiche le PDF dans le navigateur
+      res.setHeader('Content-Disposition', 'inline');
     },
   })
 );
-
 
 // --- Middlewares globaux ---
 app.use(cors());
@@ -86,20 +82,13 @@ app.use(bodyParser.json());
 app.use('/webhook-stripe', express.raw({ type: 'application/json' }));
 app.use(cookieParser());
 app.use(express.static('public'));
+
+// Routes modules
 app.use('/api', licenceRoutes);
-
-// ... ton code existant (require('express'), app.use(express.json()), etc.)
-
-const purgeRoutes = require('./routes/purge.routes');
-const { schedulePurge } = require('./services/purgeService');
-
-// routes
 app.use('/api', purgeRoutes);
 
 // CRON quotidien à 03:00 Europe/Paris
 schedulePurge();
-
-// ... ton code existant (app.listen, module.exports, etc.)
 
 // --- Ping ---
 app.get('/', (_, res) => res.send('✅ Serveur OptiCOM en ligne'));
@@ -130,14 +119,12 @@ const upload = multer({
 });
 
 // POST /api/upload-facture  (form-data: numero?, pdf)
-// Réponse: { ok, numero, filename, url }
 app.post('/api/upload-facture', requireAdminToken, upload.single('pdf'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: "Fichier PDF manquant (champ 'pdf')." });
   const numero = String(req.body.numero || path.basename(req.file.filename, '.pdf'));
   const url = `${req.protocol}://${req.get('host')}/factures/${req.file.filename}`;
   res.json({ ok: true, numero, filename: req.file.filename, url });
 });
-
 
 // =======================
 //   JSONBIN HELPERS
@@ -176,6 +163,11 @@ async function jsonbinPutAll(body) {
   }
 }
 
+// ✅ Manquait dans ton fichier mais utilisé partout
+function findLicenceIndex(list, predicate) {
+  const idx = list.findIndex(predicate);
+  return { idx, licence: idx >= 0 ? list[idx] : null };
+}
 
 // =======================
 //   Licence update helper
@@ -199,7 +191,6 @@ async function updateLicenceFields({ licenceId, opticienId, patch = {} }) {
 
   return { ok: true, licence: updated };
 }
-
 
 // =======================
 //   Licence: expéditeur
@@ -251,7 +242,6 @@ app.post('/licence/signature', async (req, res) => {
       return res.status(400).json({ success: false, error: 'SIGNATURE_MANQUANTE' });
     }
 
-    // hygiène côté serveur (trim + limite raisonnable)
     const clean = String(signature).trim().slice(0, 200);
 
     const result = await updateLicenceFields({
@@ -270,7 +260,7 @@ app.post('/licence/signature', async (req, res) => {
   }
 });
 
-// 1) Statut d’acceptation CGV pour une licence
+// 1) Statut d’acceptation CGV
 app.get('/licence/cgv-status', async (req, res) => {
   try {
     const { licenceId } = req.query || {};
@@ -301,7 +291,7 @@ app.get('/licence/cgv-status', async (req, res) => {
   }
 });
 
-// 2) Enregistrement de l’acceptation CGV (preuve)
+// 2) Enregistrement de l’acceptation CGV
 app.post('/licence/cgv-accept', async (req, res) => {
   try {
     const { licenceId, version, textHash } = req.body || {};
@@ -349,9 +339,6 @@ app.post('/licence/cgv-accept', async (req, res) => {
   }
 });
 
-
-
-
 // =======================
 //   SMS & SIGNATURE
 // =======================
@@ -361,7 +348,6 @@ function normalizeSender(raw = 'OptiCOM') {
   if (s.length > 11) s = s.slice(0, 11);
   return s;
 }
-
 function normalizeTextForCompare(s = '') {
   return String(s)
     .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
@@ -387,8 +373,7 @@ function toFRNumber(raw = '') {
   return String(raw).replace(/[^\d+]/g, '').replace(/^0/, '+33');
 }
 
-
-// Middleware — prépare sender/signature + licence JSONBin (licenceId ou opticienId)
+// Middleware — prépare sender/signature + licence JSONBin
 async function applySenderAndSignature(req, res, next) {
   try {
     const { sender, signature: sigFromClient, licenceId, opticienId } = req.body || {};
@@ -401,13 +386,11 @@ async function applySenderAndSignature(req, res, next) {
         (opticienId && String(l.opticien?.id) === String(opticienId))
     );
 
-    // fallback permissif : pas bloquant si on n'a pas de licence (mais /send-sms vérifiera)
     const candidateSender = sender || licence?.libelleExpediteur || licence?.opticien?.enseigne || 'OptiCOM';
     const normalizedSender = normalizeSender(candidateSender);
     const signatureFromLicence = licence?.signature || '';
     const chosenSignature = (sigFromClient || signatureFromLicence || '').trim();
 
-    // on garde ce qu'il faut si d'autres routes veulent écrire
     req._jsonbin = { list, rawRecord, idx, licence };
     req.smsContext = { licence, idx, sender: normalizedSender, signature: chosenSignature };
     next();
@@ -417,24 +400,15 @@ async function applySenderAndSignature(req, res, next) {
   }
 }
 
-
 // ===============================
 //   GoCardless: mandat & licence
 // ===============================
 app.post('/create-mandat', async (req, res) => {
   const {
-    nomMagasin, // <-- source principale
-    email,
-    adresse,
-    ville,
-    codePostal,
-    pays,
-    formuleId,
-    siret,
-    telephone
+    nomMagasin, email, adresse, ville, codePostal, pays,
+    formuleId, siret, telephone
   } = req.body;
 
-  // On prend nomMagasin sinon compatibilité, mais on refuse si vide
   const enseigne = (nomMagasin || req.body.enseigne || req.body.nom || '').trim();
   if (!enseigne) {
     return res.status(400).json({ error: 'Le nom du magasin (enseigne) est obligatoire.' });
@@ -445,7 +419,7 @@ app.post('/create-mandat', async (req, res) => {
 
     const customerData = {
       email,
-      company_name: enseigne, // ✅ plus de "Magasin" par défaut
+      company_name: enseigne,
       address_line1: adresse,
       city: ville,
       postal_code: codePostal,
@@ -476,17 +450,8 @@ app.post('/create-mandat', async (req, res) => {
       return res.status(500).json({ error: 'Erreur GoCardless. Vérifiez vos informations.' });
     }
 
-    // On stocke toutes les infos nécessaires
     sessionTokenMap.set(session_token, {
-      enseigne,
-      email,
-      adresse,
-      ville,
-      codePostal,
-      pays,
-      formuleId,
-      siret,
-      telephone
+      enseigne, email, adresse, ville, codePostal, pays, formuleId, siret, telephone
     });
 
     res.status(200).json({ url: data.redirect_flows.redirect_url });
@@ -496,9 +461,6 @@ app.post('/create-mandat', async (req, res) => {
   }
 });
 
-
-
-
 app.get('/validation-mandat', async (req, res) => {
   const redirectFlowId = req.query.redirect_flow_id;
   const sessionToken   = req.query.session_token;
@@ -506,7 +468,7 @@ app.get('/validation-mandat', async (req, res) => {
     return res.status(400).send('Paramètre manquant ou session expirée.');
   }
 
-  const normalizeSender = (raw = 'OptiCOM') => {
+  const normalizeSenderUpper = (raw = 'OptiCOM') => {
     let s = String(raw).toUpperCase().replace(/[^A-Z0-9]/g, '');
     if (s.length < 3) s = 'OPTICOM';
     if (s.length > 11) s = s.slice(0, 11);
@@ -514,7 +476,6 @@ app.get('/validation-mandat', async (req, res) => {
   };
 
   try {
-    // 1) Confirme le redirect flow
     const confirmResponse = await goCardlessClient.redirectFlows.complete(
       redirectFlowId,
       { session_token: sessionToken }
@@ -529,22 +490,17 @@ app.get('/validation-mandat', async (req, res) => {
     const customerId = flow.links.customer;
     const mandateId  = flow.links.mandate;
 
-    // 2) Récupère les infos mises en session dans /create-mandat
     const opt = sessionTokenMap.get(sessionToken);
     if (!opt) return res.status(400).send('Données opticien manquantes ou session expirée.');
 
-    // 🟢 On prend en priorité nomMagasin si dispo
     const enseigne = opt.nomMagasin || opt.enseigne || 'Opticien sans nom';
-
     const selectedFormule = formulas.find(f => f.id === opt.formuleId) || { name: 'Formule inconnue', credits: 0 };
     const abonnement = selectedFormule.name;
     const credits    = selectedFormule.credits;
 
     const licenceKey = uuidv4();
+    const libelleExpediteur = normalizeSenderUpper(enseigne);
 
-    const libelleExpediteur = normalizeSender(enseigne);
-
-    // 3) Construit la licence
     const newLicence = {
       id: uuidv4(),
       licence: licenceKey,
@@ -554,7 +510,7 @@ app.get('/validation-mandat', async (req, res) => {
       libelleExpediteur,
       opticien: {
         id: 'opt-' + Math.random().toString(36).slice(2, 10),
-        enseigne, // 🟢 ici toujours le vrai nom magasin
+        enseigne,
         nom: enseigne,
         email: opt.email,
         adresse: opt.adresse,
@@ -568,10 +524,9 @@ app.get('/validation-mandat', async (req, res) => {
       customerId
     };
 
-    // 4) Sauvegarde JSONBin
-    const binId = must(process.env.JSONBIN_BIN_ID, 'JSONBIN_BIN_ID');
+    // Sauvegarde JSONBin
+    const binId = must(JSONBIN_BIN_ID, 'JSONBIN_BIN_ID');
     const apiKey = must(JSONBIN_KEY, 'JSONBIN_KEY');
-
 
     const getResponse = await axios.get(`https://api.jsonbin.io/v3/b/${binId}/latest`, {
       headers: { 'X-Master-Key': apiKey, 'X-Bin-Meta': 'false' }
@@ -647,38 +602,28 @@ app.get('/validation-mandat', async (req, res) => {
 const crypto = require('crypto');
 
 // anti spam léger par (licenceId, numéro)
-const lastSent = new Map();                   // key: `${licenceId}:${numeroNormalise}`
-const MIN_INTERVAL_MS = 15 * 1000;            // 15 s entre 2 envois au même numéro depuis la même licence
+const lastSent = new Map();
+const MIN_INTERVAL_MS = 15 * 1000;
 
 function ymKey(d = new Date()) {
   return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;
 }
-
 function sha256Hex(s) {
   return crypto.createHash('sha256').update(String(s)).digest('hex');
 }
-
-// numéro E.164 « +33… » et version normalisée sans non-chiffres pour clé RL/optout
-
 function normalizeFR(msisdn='') {
   return toFRNumber(msisdn).replace(/\D/g,'');
 }
-
-// Créneaux FR prudents: Lun–Sam 08:00–20:00 (heure Paris). Dimanche interdit.
 function isQuietHours(date = new Date()) {
   const paris = new Date(date.toLocaleString('en-US', { timeZone: 'Europe/Paris' }));
   const day = paris.getDay();  // 0=Dim..6=Sam
   const hour = paris.getHours();
   return (day === 0) || (hour < 8) || (hour >= 20);
 }
-
-// consentement marketing au niveau licence (si présent)
 function hasMarketingConsent(licence) {
   const c = licence?.consentements?.marketingSms || licence?.marketingSms;
   return !!(c && c.value && !c.unsubscribedAt);
 }
-
-// opt-out ciblé (par numéro)
 function isOptedOut(licence, numeroE164) {
   const n = normalizeFR(numeroE164);
   if (Array.isArray(licence?.optOuts) && licence.optOuts.some(x => normalizeFR(x) === n)) return true;
@@ -686,8 +631,6 @@ function isOptedOut(licence, numeroE164) {
   if (c && c.unsubscribedAt) return true;
   return false;
 }
-
-// Lien STOP (désinscription)
 function hmacShort(input='') {
   return crypto.createHash('sha256').update(String(input)).digest('hex').slice(0,16);
 }
@@ -706,15 +649,12 @@ async function markOptOut(licenceId, phoneE164) {
   await jsonbinPutAll(Array.isArray(rawRecord) ? list : list[idx]);
   return true;
 }
-
-// Journalisation minimale d’un envoi dans la licence (hash du message)
 async function appendSmsLogAndPersist({ list, rawRecord, idx, licence, entry }) {
   licence.historiqueSms = Array.isArray(licence.historiqueSms) ? licence.historiqueSms : [];
   licence.historiqueSms.push(entry);
   const bodyToPut = Array.isArray(rawRecord) ? (list[idx] = licence, list) : licence;
   await jsonbinPutAll(bodyToPut);
 }
-
 
 // --- Routes opt-out ---
 app.get('/unsubscribe', async (req, res) => {
@@ -741,9 +681,7 @@ app.get('/unsubscribe', async (req, res) => {
   }
 });
 
-// --- Admin Opt-out: export CSV & ajout manuel ---
-// Protégées par le même jeton que l’upload de facture (ADMIN_UPLOAD_TOKEN)
-
+// --- Admin Opt-out ---
 app.get('/api/optouts/export', requireAdminToken, async (req, res) => {
   try {
     const { licenceId } = req.query || {};
@@ -772,7 +710,7 @@ app.post('/api/optouts/add', requireAdminToken, async (req, res) => {
       return res.status(400).json({ ok:false, error:'PARAMS' });
     }
 
-    const phone = toFRNumber(phoneNumber); // normalise en +33...
+    const phone = toFRNumber(phoneNumber);
     const { list, rawRecord } = await jsonbinGetAll();
     const { idx, licence } = findLicenceIndex(list, l => String(l.id) === String(licenceId));
     if (idx === -1) return res.status(404).json({ ok:false, error:'NOT_FOUND' });
@@ -788,7 +726,6 @@ app.post('/api/optouts/add', requireAdminToken, async (req, res) => {
     res.status(500).json({ ok:false, error:'SERVER_ERROR' });
   }
 });
-
 
 // =======================
 //   Consentement marketing
@@ -806,7 +743,6 @@ app.post('/consent', async (req, res) => {
     const { idx, licence } = findLicenceIndex(list, l => String(l.id) === String(licenceId));
     if (idx === -1) return res.status(404).json({ success:false, error:'LICENCE_INTROUVABLE' });
 
-    // tableau "consents" (pour check rapide) + "consentsLog" (preuve détaillée)
     const set = new Set([ ...(licence.consents || []) ]);
     set.add(phone);
     licence.consents = Array.from(set);
@@ -820,7 +756,7 @@ app.post('/consent', async (req, res) => {
       ip: (req.headers['x-forwarded-for']?.toString().split(',')[0] || req.ip || '').trim(),
       userAgent: req.get('user-agent') || ''
     });
-    licence.consentsLog = log.slice(-5000); // borne raisonnable
+    licence.consentsLog = log.slice(-5000);
 
     const bodyToPut = Array.isArray(rawRecord) ? (list[idx] = licence, list) : licence;
     await jsonbinPutAll(bodyToPut);
@@ -832,10 +768,8 @@ app.post('/consent', async (req, res) => {
   }
 });
 
-
-
 // ============================
-//   Envoi SMS (tout JSONBin)
+//   Envoi SMS (JSONBin)
 // ============================
 async function sendSmsTransactional(req, res) {
   const { phoneNumber, message, licenceId, opticienId } = req.body || {};
@@ -897,7 +831,6 @@ async function sendSmsTransactional(req, res) {
       return res.status(502).json({ success:false, error:`Erreur SMSMode: ${smsText}` });
     }
 
-    // décrémentation éventuelle + journalisation
     if (licence.abonnement !== 'Illimitée') {
       licence.credits = Math.max(0, Number(licence.credits || 0) - 1);
     }
@@ -932,8 +865,7 @@ async function sendSmsTransactional(req, res) {
 app.post('/send-sms', applySenderAndSignature, sendSmsTransactional);
 app.post('/send-transactional', applySenderAndSignature, sendSmsTransactional);
 
-
-// Alias promotionnel (même décrémentation, seul endpoint SMSMode change si besoin)
+// Alias promotionnel
 app.post('/send-promotional', applySenderAndSignature, async (req, res) => {
   const { phoneNumber, message, licenceId, opticienId, marketingConsent } = req.body || {};
 
@@ -955,10 +887,8 @@ app.post('/send-promotional', applySenderAndSignature, async (req, res) => {
     }
     const licence = found.licence;
 
-    // Numéro au format FR/E.164
     const numero = toFRNumber(phoneNumber);
 
-    // 🛑 Consentement marketing requis (body ou liste serveur)
     const hasConsent =
       marketingConsent === true ||
       (Array.isArray(licence.consents) && licence.consents.includes(numero)) ||
@@ -968,12 +898,10 @@ app.post('/send-promotional', applySenderAndSignature, async (req, res) => {
       return res.status(403).json({ success: false, error: 'CONSENTEMENT_MARKETING_ABSENT' });
     }
 
-    // 📴 Respect du STOP / désinscription déjà faite
     if (isOptedOut(licence, numero)) {
       return res.status(403).json({ success: false, error: 'DESTINATAIRE_DESINSCRIT' });
     }
 
-    // ⏱️ anti-spam : 15s entre 2 envois (licence, numéro)
     const rlKey = `${licence.id}:${numero}`;
     const last = lastSent.get(rlKey) || 0;
     if (Date.now() - last < MIN_INTERVAL_MS) {
@@ -984,17 +912,13 @@ app.post('/send-promotional', applySenderAndSignature, async (req, res) => {
     lastSent.set(rlKey, Date.now());
 
     const { sender, signature } = req.smsContext;
-
-    // ✍️ Ajoute la signature si absente
     const baseText = buildFinalMessage(message || '', signature || '');
 
-    // 🇫🇷 Prospection FR : STOP au 36111 obligatoire (sender alpha)
     function ensureStopMention(text) {
       return /stop\s+au\s+36111/i.test(text) ? text : `${text}\nSTOP au 36111`;
     }
     const finalMessage = ensureStopMention(baseText);
 
-    // Envoi SMSMode
     const params = new URLSearchParams();
     params.append('pseudo', process.env.SMSMODE_LOGIN);
     params.append('pass', process.env.SMSMODE_PASSWORD);
@@ -1018,12 +942,10 @@ app.post('/send-promotional', applySenderAndSignature, async (req, res) => {
       return res.status(502).json({ success: false, error: `Erreur SMSMode: ${smsText}` });
     }
 
-    // Décrément crédits si ≠ Illimitée
     if (licence.abonnement !== 'Illimitée') {
       licence.credits = Math.max(0, Number(licence.credits || 0) - 1);
     }
 
-    // Log + persistance JSONBin
     await appendSmsLogAndPersist({
       list,
       rawRecord,
@@ -1054,24 +976,18 @@ app.post('/send-promotional', applySenderAndSignature, async (req, res) => {
   }
 });
 
-
-
-
 // ===================================
 //   Achat de crédits via GoCardless
 // ===================================
-// Prix et TVA (utilisés pour le calcul TTC)
 app.post('/achat-credits-gocardless', async (req, res) => {
   const { email, quantity } = req.body;
   const qty = Math.max(1, parseInt(quantity || '1'));
 
-  // 💰 Prix HT & TTC
-  const prixHT = 6; // € HT par pack
+  const prixHT = 6;
   const tauxTVA = 0.20;
-  const prixTTC = prixHT * (1 + tauxTVA); // 7,20 TTC
+  const prixTTC = prixHT * (1 + tauxTVA);
 
   try {
-    // 1️⃣ Récupérer licence
     const { list, rawRecord } = await jsonbinGetAll();
     const { idx, licence } = findLicenceIndex(list, l =>
       String(l.opticien?.email).toLowerCase() === String(email).toLowerCase()
@@ -1081,7 +997,6 @@ app.post('/achat-credits-gocardless', async (req, res) => {
     const mandate = licence.mandateId;
     if (!mandate) return res.status(400).json({ error: "Aucun mandat associé à cette licence" });
 
-    // 2️⃣ Paiement GoCardless (montant TTC)
     const response = await fetch(`${GO_CARDLESS_API_BASE}/payments`, {
       method: 'POST',
       headers: {
@@ -1091,7 +1006,7 @@ app.post('/achat-credits-gocardless', async (req, res) => {
       },
       body: JSON.stringify({
         payments: {
-          amount: Math.round(prixTTC * qty * 100), // en centimes TTC
+          amount: Math.round(prixTTC * qty * 100),
           currency: 'EUR',
           links: { mandate },
           description: `Achat ponctuel de ${qty * 100} crédits SMS - OptiCOM`,
@@ -1106,13 +1021,11 @@ app.post('/achat-credits-gocardless', async (req, res) => {
       return res.status(500).json({ error: 'Échec du paiement GoCardless.' });
     }
 
-    // 3️⃣ Ajout des crédits
     const creditsAjoutes = qty * 100;
     licence.credits = (Number(licence.credits) || 0) + creditsAjoutes;
     const bodyToPut = Array.isArray(rawRecord) ? (list[idx] = licence, list) : licence;
     await jsonbinPutAll(bodyToPut);
 
-    // 4️⃣ Génération facture PDF
     try {
       const facturePayload = {
         opticien: licence.opticien,
@@ -1153,16 +1066,12 @@ app.post('/achat-credits-gocardless', async (req, res) => {
       console.error('❌ Erreur génération facture :', e);
     }
 
-    // 5️⃣ Réponse finale
     res.json({ success: true, creditsAjoutes, prixHT, prixTTC, tva: prixHT * tauxTVA });
   } catch (err) {
     console.error('❗ Erreur achat GoCardless (serveur) :', err);
     res.status(500).json({ error: 'Erreur serveur inattendue' });
   }
 });
-
-
-
 
 // =======================
 //   Stripe: checkout + WH
@@ -1262,55 +1171,162 @@ app.post('/webhook-stripe', express.raw({ type: 'application/json' }), async (re
   res.status(200).send('OK');
 });
 
-// ---- Licence lookup (clé) ----
-app.get('/licence/by-key', async (req, res) => {
-  try {
-    const cle = String(req.query.cle || '').trim();
-    if (!cle) return res.status(400).json({ error: "Paramètre 'cle' requis" });
+// =======================
+//   Licences - API
+// =======================
 
-    const { list } = await jsonbinGetAll();
-    const found = list.find(l => {
-      const k = String(l?.licence ?? l?.cle ?? l?.key ?? '').trim();
-      return k === cle; // casse respectée (tu m’as dit qu’il y a des minuscules)
-    });
-    if (!found) return res.status(404).json({ error: 'Licence introuvable' });
+// Normalisation tolérante pour comparaison de clés
+function normKey(s = '') {
+  return String(s).replace(/[\s-]/g, '').toUpperCase();
+}
+
+// Recherche générique
+async function findLicence({ cle, id }) {
+  const { list } = await jsonbinGetAll();
+  if (id) {
+    const byId = list.find((l) => String(l.id).toLowerCase() === String(id).toLowerCase());
+    if (byId) return byId;
+  }
+  if (cle) {
+    const q = normKey(cle);
+    const byKey = list.find((l) => normKey(l.licence || l.cle || l.key || '') === q);
+    if (byKey) return byKey;
+  }
+  return null;
+}
+
+// ✅ Route unifiée + alias rétrocompat
+app.get(['/api/licence/by-key', '/licence/by-key', '/licence-by-key', '/api/licence', '/licence'], async (req, res) => {
+  try {
+    const cle = req.query.cle || req.query.key || req.query.k;
+    const id  = req.query.id; // optionnel
+    if (!cle && !id) return res.status(400).json({ error: 'Paramètre cle ou id requis' });
+
+    const licence = await findLicence({ cle, id });
+    if (!licence) return res.status(404).json({ error: 'LICENCE_INTROUVABLE' });
 
     res.set('Cache-Control', 'no-store');
-    return res.json({ licence: found });
+    return res.json({ licence });
   } catch (e) {
-    console.error('GET /licence/by-key error:', e);
+    console.error('❌ /licence/by-key error:', e);
     return res.status(500).json({ error: 'SERVER_ERROR' });
   }
 });
 
-// ---- Licence lookup (id stable), utile à d’autres écrans
-app.get('/licence/by-id', async (req, res) => {
+// Expose la liste (lecture seule)
+app.get('/api/licences', async (req, res) => {
   try {
-    const id = String(req.query.id || '').trim();
-    if (!id) return res.status(400).json({ error: "Paramètre 'id' requis" });
-
     const { list } = await jsonbinGetAll();
-    const found = list.find(l => String(l?.id ?? l?.opticien?.id ?? '').trim() === id);
-    if (!found) return res.status(404).json({ error: 'Licence introuvable' });
-
-    res.set('Cache-Control', 'no-store');
-    return res.json({ licence: found });
+    res.json(Array.isArray(list) ? list : (list ? [list] : []));
   } catch (e) {
-    console.error('GET /licence/by-id error:', e);
-    return res.status(500).json({ error: 'SERVER_ERROR' });
+    console.error('❌ /api/licences error:', e);
+    res.status(500).json({ error: 'JSONBIN_READ_FAILED', detail: String(e.message || e) });
   }
 });
 
-// ---- Compat anciens clients (logs montrent /licence-by-key et /licence)
-app.get('/licence-by-key', (req, res) => {
-  const cle = String(req.query.cle || '');
-  return res.redirect(307, `/licence/by-key?cle=${encodeURIComponent(cle)}`);
-});
-app.get('/licence', (req, res) => {
-  const cle = String(req.query.cle || '');
-  return res.redirect(307, `/licence/by-key?cle=${encodeURIComponent(cle)}`);
-});
+// =======================
+//   CRON formules / résiliation
+// =======================
+const cron = require('node-cron');
+const ISO = (d = new Date()) => d.toISOString().slice(0, 10); // YYYY-MM-DD
+const TARIFS_GC = { Starter: 600, Pro: 1200, Premium: 1800 };
 
+cron.schedule('0 3 * * *', async () => {
+  console.log('⏳ CRON: vérification formules & résiliations...');
+  const today = ISO();
+
+  try {
+    const { list, rawRecord } = await jsonbinGetAll();
+    let updated = false;
+
+    for (let i = 0; i < list.length; i++) {
+      const licence = list[i];
+
+      // 1) Changement de formule
+      if (licence.nouvelleFormule && licence.dateChangement) {
+        if (today >= String(licence.dateChangement).slice(0, 10)) {
+          const newPlan = String(licence.nouvelleFormule);
+          console.log(`🔄 Passage de ${licence.opticien?.email} à la formule ${newPlan}`);
+
+          licence.abonnement = newPlan;
+          delete licence.nouvelleFormule;
+          delete licence.dateChangement;
+          updated = true;
+
+          const amount = TARIFS_GC[newPlan] || TARIFS_GC.Starter;
+          if (licence.subscriptionId) {
+            try {
+              await fetch(`${GO_CARDLESS_API_BASE}/subscriptions/${licence.subscriptionId}`, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': `Bearer ${process.env.GOCARDLESS_API_KEY}`,
+                  'GoCardless-Version': '2015-07-06',
+                },
+                body: JSON.stringify({ subscriptions: { amount } }),
+              });
+              console.log(`✅ Subscription mise à jour (${amount} centimes) pour ${licence.opticien?.email}`);
+            } catch (e) {
+              console.error('❌ GC update subscription amount:', e);
+            }
+          }
+        }
+      }
+
+      // 2) Résiliation programmée (corrigé: accepte dateResiliation ou resiliationDate)
+      const resiDate = licence.dateResiliation || licence.resiliationDate;
+      if (resiDate) {
+        const cut = String(resiDate).slice(0, 10);
+        if (today >= cut) {
+          console.log(`🛑 Résiliation effective pour ${licence.opticien?.email} (date ${cut})`);
+
+          try {
+            if (licence.subscriptionId) {
+              await fetch(`${GO_CARDLESS_API_BASE}/subscriptions/${licence.subscriptionId}/actions/cancel`, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': `Bearer ${process.env.GOCARDLESS_API_KEY}`,
+                  'GoCardless-Version': '2015-07-06',
+                },
+                body: JSON.stringify({}),
+              });
+              console.log(`✅ Subscription annulée pour ${licence.opticien?.email}`);
+            } else if (licence.mandateId) {
+              await fetch(`${GO_CARDLESS_API_BASE}/mandates/${licence.mandateId}/actions/cancel`, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': `Bearer ${process.env.GOCARDLESS_API_KEY}`,
+                  'GoCardless-Version': '2015-07-06',
+                },
+                body: JSON.stringify({}),
+              });
+              console.log(`✅ Mandat annulé pour ${licence.opticien?.email}`);
+            }
+          } catch (e) {
+            console.error('❌ GC cancel (subscription/mandate):', e);
+          }
+
+          // Désactivation
+          licence.active = false;
+          delete licence.licence; // optionnel: retirer la clé d’accès
+          delete licence.credits; // optionnel
+          updated = true;
+        }
+      }
+    }
+
+    if (updated) {
+      await jsonbinPutAll(Array.isArray(rawRecord) ? list : list[0] || {});
+      console.log('✅ CRON: mises à jour sauvegardées.');
+    } else {
+      console.log('👌 CRON: rien à faire aujourd’hui.');
+    }
+  } catch (err) {
+    console.error('❌ Erreur CRON:', err);
+  }
+});
 
 // =======================
 //   Facture PDF (JSONBin)
@@ -1341,8 +1357,6 @@ app.post('/api/generate-invoice', async (req, res) => {
 
   stream.on('finish', async () => {
     try {
-      // On ne push pas ici dans la licence pour éviter double-édition concurrente.
-      // Les routes appelantes (Stripe / GoCardless) ajoutent l’URL dans licence.factures.
       res.json({ url: `/factures/${fileName}` });
     } catch (err) {
       console.error('❌ Erreur après PDF:', err);
@@ -1356,247 +1370,8 @@ app.post('/api/generate-invoice', async (req, res) => {
   });
 });
 
-app.post('/changer-formule', async (req, res) => {
-  const { email, nouvelleFormule } = req.body;
-  if (!email || !nouvelleFormule) {
-    return res.status(400).json({ error: 'Email et nouvelle formule requis' });
-  }
-
-  try {
-    const { list, rawRecord } = await jsonbinGetAll();
-    const { idx, licence } = findLicenceIndex(list, l => String(l.opticien?.email).toLowerCase() === String(email).toLowerCase());
-    if (idx === -1) return res.status(404).json({ error: "Licence introuvable" });
-
-    if (!licence.next_payment_date) {
-      return res.status(400).json({ error: "Aucune date de renouvellement trouvée" });
-    }
-
-    licence.nouvelleFormule = nouvelleFormule;
-    licence.dateChangement = licence.next_payment_date; // Activation à la prochaine échéance
-
-    const bodyToPut = Array.isArray(rawRecord) ? (list[idx] = licence, list) : licence;
-    await jsonbinPutAll(bodyToPut);
-
-    res.json({ success: true, message: `Formule ${nouvelleFormule} programmée pour le ${licence.dateChangement}` });
-  } catch (err) {
-    console.error('❗ Erreur changer-formule :', err);
-    res.status(500).json({ error: 'Erreur serveur' });
-  }
-});
-
-app.post('/resiliation-abonnement', async (req, res) => {
-  try {
-    const { email, licenceId } = req.body || {};
-    if (!email && !licenceId) {
-      return res.status(400).json({ success: false, error: 'EMAIL_OU_LICENCE_ID_REQUIS' });
-    }
-
-    const { list, rawRecord } = await jsonbinGetAll();
-
-    let { idx, licence } =
-      licenceId
-        ? findLicenceIndex(list, l => String(l.id) === String(licenceId))
-        : findLicenceIndex(list, l => String(l.opticien?.email).toLowerCase() === String(email).toLowerCase());
-
-    if (idx === -1) return res.status(404).json({ success: false, error: 'LICENCE_INTROUVABLE' });
-
-    // On prend la prochaine échéance connue pour la date de fin
-    const dateResiliation =
-      licence.renouvellement || licence.next_payment_date || new Date().toISOString().slice(0, 10);
-
-    licence.resiliationDemandee = true;
-    licence.dateResiliation = dateResiliation;
-
-    const bodyToPut = Array.isArray(rawRecord) ? (list[idx] = licence, list) : licence;
-    await jsonbinPutAll(bodyToPut);
-
-    return res.json({ success: true, dateResiliation });
-  } catch (e) {
-    console.error('❌ /resiliation-abonnement error:', e);
-    return res.status(500).json({ success: false, error: 'SERVER_ERROR' });
-  }
-});
-
-// --- Expose la liste des licences (lecture seule) ---
-app.get('/api/licences', async (req, res) => {
-  try {
-    const { list } = await jsonbinGetAll(); // utilise JSONBIN_BIN_ID + JSONBIN_API_KEY côté Render
-    res.json(Array.isArray(list) ? list : (list ? [list] : []));
-  } catch (e) {
-    console.error('❌ /api/licences error:', e);
-    res.status(500).json({ error: 'JSONBIN_READ_FAILED', detail: String(e.message || e) });
-  }
-});
-
-
-
-const cron = require('node-cron');
-
-const ISO = (d = new Date()) => d.toISOString().slice(0, 10); // YYYY-MM-DD
-
-// Montants (centimes) par formule pour GoCardless
-const TARIFS_GC = { Starter: 600, Pro: 1200, Premium: 1800 };
-
-cron.schedule('0 3 * * *', async () => { // tous les jours à 03:00
-  console.log('⏳ CRON: vérification formules & résiliations...');
-  const today = ISO();
-
-  try {
-    const { list, rawRecord } = await jsonbinGetAll();
-    let updated = false;
-    const toDelete = []; // indices licences à supprimer du JSONBin
-
-    for (let i = 0; i < list.length; i++) {
-      const licence = list[i];
-
-      // ---------- 1) CHANGEMENT DE FORMULE À L’ÉCHÉANCE ----------
-      if (licence.nouvelleFormule && licence.dateChangement) {
-        if (today >= String(licence.dateChangement).slice(0, 10)) {
-          const newPlan = String(licence.nouvelleFormule);
-          console.log(`🔄 Passage de ${licence.opticien?.email} à la formule ${newPlan}`);
-
-          // Mets à jour le champ *abonnement* (actuelle source dans le front)
-          licence.abonnement = newPlan;
-          delete licence.nouvelleFormule;
-          delete licence.dateChangement;
-          updated = true;
-
-          // Ajuste le montant GoCardless si on a un subscriptionId
-          const amount = TARIFS_GC[newPlan] || TARIFS_GC.Starter;
-          if (licence.subscriptionId) {
-            try {
-              await fetch(`${GO_CARDLESS_API_BASE}/subscriptions/${licence.subscriptionId}`, {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                  'Authorization': `Bearer ${process.env.GOCARDLESS_API_KEY}`,
-                  'GoCardless-Version': '2015-07-06',
-                },
-                body: JSON.stringify({ subscriptions: { amount } }),
-              });
-              console.log(`✅ Subscription mise à jour (${amount} centimes) pour ${licence.opticien?.email}`);
-            } catch (e) {
-              console.error('❌ GC update subscription amount:', e);
-            }
-          }
-        }
-      }
-
-      // ---------- 2) RÉSILIATION À LA DATE PROGRAMMÉE ----------
-      if (licence.resiliationDate) {
-        const cut = String(licence.resiliationDate).slice(0, 10);
-        if (today >= cut) {
-          console.log(`🛑 Résiliation effective pour ${licence.opticien?.email} (date ${cut})`);
-
-          // Arrête les débits côté GoCardless (subscription si présente, sinon mandat)
-          try {
-            if (licence.subscriptionId) {
-              // annule l’abonnement (immédiat)
-              await fetch(`${GO_CARDLESS_API_BASE}/subscriptions/${licence.subscriptionId}/actions/cancel`, {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                  'Authorization': `Bearer ${process.env.GOCARDLESS_API_KEY}`,
-                  'GoCardless-Version': '2015-07-06',
-                },
-                body: JSON.stringify({}), // rien à passer
-              });
-              console.log(`✅ Subscription annulée pour ${licence.opticien?.email}`);
-            } else if (licence.mandateId) {
-              // pas d’abonnement géré : on annule le mandat pour bloquer tout futur débit
-              await fetch(`${GO_CARDLESS_API_BASE}/mandates/${licence.mandateId}/actions/cancel`, {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                  'Authorization': `Bearer ${process.env.GOCARDLESS_API_KEY}`,
-                  'GoCardless-Version': '2015-07-06',
-                },
-                body: JSON.stringify({}),
-              });
-              console.log(`✅ Mandat annulé pour ${licence.opticien?.email}`);
-            }
-          } catch (e) {
-            console.error('❌ GC cancel (subscription/mandate):', e);
-          }
-
-          // Supprime la licence du JSONBin pour bloquer l’accès depuis l’app
-          licence.active = false;
-delete licence.licence;        // optionnel: retirer la clé d’accès
-delete licence.credits;        // optionnel
-updated = true;
-
-        }
-      }
-    }
-
-    // ---------- 3) ÉCRITURE JSONBIN ----------
-    if (toDelete.length) {
-      // supprime en partant de la fin pour conserver les index
-      toDelete.sort((a, b) => b - a).forEach(idx => list.splice(idx, 1));
-      updated = true;
-      console.log(`🧹 ${toDelete.length} licence(s) supprimée(s) du JSONBin (résiliation).`);
-    }
-
-    if (updated) {
-      // jsonbinPutAll sait gérer array vs objet unique via rawRecord
-      await jsonbinPutAll(Array.isArray(rawRecord) ? list : list[0] || {});
-      console.log('✅ CRON: mises à jour sauvegardées.');
-    } else {
-      console.log('👌 CRON: rien à faire aujourd’hui.');
-    }
-  } catch (err) {
-    console.error('❌ Erreur CRON:', err);
-  }
-});
-
-// =======================
-//   Licence lookup (GET)
-// =======================
-function normKey(s = '') {
-  // comparaison tolérante: supprime espaces & tirets, insensible à la casse
-  return String(s).replace(/[\s-]/g, '').toUpperCase();
-}
-
-/**
- * Renvoie une licence au format { licence: {...} }
- * Recherche par clé (licence/cel/key) ou par id si fourni.
- */
-async function findLicence({ cle, id }) {
-  const { list } = await jsonbinGetAll();
-  if (id) {
-    const byId = list.find((l) => String(l.id).toLowerCase() === String(id).toLowerCase());
-    if (byId) return byId;
-  }
-  if (cle) {
-    const q = normKey(cle);
-    const byKey = list.find((l) => normKey(l.licence || l.cle || l.key || '') === q);
-    if (byKey) return byKey;
-  }
-  return null;
-}
-
-// Routes "officielles" + alias rétrocompat
-app.get(['/api/licence/by-key', '/licence/by-key', '/licence-by-key', '/api/licence', '/licence'], async (req, res) => {
-  try {
-    const cle = req.query.cle || req.query.key || req.query.k;
-    const id  = req.query.id; // optionnel
-    if (!cle && !id) return res.status(400).json({ error: 'Paramètre cle ou id requis' });
-
-    const licence = await findLicence({ cle, id });
-    if (!licence) return res.status(404).json({ error: 'LICENCE_INTROUVABLE' });
-
-    return res.json({ licence });
-  } catch (e) {
-    console.error('❌ /licence/by-key error:', e);
-    return res.status(500).json({ error: 'SERVER_ERROR' });
-  }
-});
-
 // Petit ping JSON brut pour debug local
 app.get('/api/ping', (_, res) => res.json({ ok: true }));
-
-
-
 
 // =======================
 //   Lancement serveur
