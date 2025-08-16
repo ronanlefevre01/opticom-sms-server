@@ -18,11 +18,11 @@ const licenceRoutes = require('./routes/licence.routes');
 const purgeRoutes = require('./routes/purge.routes');
 const { schedulePurge } = require('./services/purgeService');
 
-// --- JSONBin config (une seule clé, deux noms possibles côté env) ---
+// --- JSONBin config
 const JSONBIN_BIN_ID = process.env.JSONBIN_BIN_ID;
-const JSONBIN_KEY = process.env.JSONBIN_MASTER_KEY || process.env.JSONBIN_API_KEY; // accepte l’un ou l’autre
+const JSONBIN_KEY = process.env.JSONBIN_MASTER_KEY || process.env.JSONBIN_API_KEY;
 
-// ---- CGV (version + texte brut Markdown + hash) ----
+// ---- CGV
 const CGV_VERSION = process.env.CGV_VERSION || '2025-08-14';
 const CGV_FILE = path.join(__dirname, 'public', 'legal', `cgv-${CGV_VERSION}.md`);
 
@@ -35,7 +35,7 @@ try {
   console.warn('⚠️ CGV file not found. You can still use env CGV_TEXT_HASH if provided.');
 }
 
-// fetch (ESM compat)
+// fetch ESM
 const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
 
 const app = express();
@@ -63,7 +63,6 @@ const formulas = [
 const factureDir = path.join(__dirname, 'public/factures');
 if (!fs.existsSync(factureDir)) fs.mkdirSync(factureDir, { recursive: true });
 
-// Servir les PDF publiquement : https://<host>/factures/<fichier>.pdf
 app.use(
   '/factures',
   express.static(factureDir, {
@@ -79,8 +78,13 @@ app.use(
 // --- Middlewares globaux ---
 app.use(cors());
 app.use(cookieParser());
-// ⚠️ ne PAS mettre express.raw globalement ; on l’applique uniquement sur /webhook-stripe
-app.use(bodyParser.json());
+
+// ⛔️ Garanti: pas de JSON parser pour /webhook-stripe (Stripe exige RAW)
+app.use((req, res, next) => {
+  if (req.originalUrl === '/webhook-stripe') return next();
+  return bodyParser.json()(req, res, next);
+});
+
 app.use(express.static('public'));
 
 // Routes modules
@@ -93,9 +97,8 @@ schedulePurge();
 // --- Ping ---
 app.get('/', (_, res) => res.send('✅ Serveur OptiCOM en ligne'));
 
-// ===== Upload de facture (PDF) protégé par token =====
+// ===== Upload facture PDF (protégé par token) =====
 const ADMIN_UPLOAD_TOKEN = process.env.ADMIN_UPLOAD_TOKEN;
-
 function requireAdminToken(req, res, next) {
   if (!ADMIN_UPLOAD_TOKEN) return res.status(500).json({ error: 'ADMIN_UPLOAD_TOKEN manquant côté serveur' });
   const auth = req.get('authorization') || '';
@@ -103,7 +106,6 @@ function requireAdminToken(req, res, next) {
   next();
 }
 
-// Multer: enregistre directement le fichier dans public/factures
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, factureDir),
   filename: (req, _file, cb) => {
@@ -114,11 +116,10 @@ const storage = multer.diskStorage({
 });
 const upload = multer({
   storage,
-  limits: { fileSize: 15 * 1024 * 1024 }, // 15 MB
+  limits: { fileSize: 15 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => cb(null, file.mimetype === 'application/pdf'),
 });
 
-// POST /api/upload-facture  (form-data: numero?, pdf)
 app.post('/api/upload-facture', requireAdminToken, upload.single('pdf'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: "Fichier PDF manquant (champ 'pdf')." });
   const numero = String(req.body.numero || path.basename(req.file.filename, '.pdf'));
@@ -163,7 +164,6 @@ async function jsonbinPutAll(body) {
   }
 }
 
-// ✅ utilitaire manquant
 function findLicenceIndex(list, predicate) {
   const idx = list.findIndex(predicate);
   return { idx, licence: idx >= 0 ? list[idx] : null };
@@ -198,30 +198,19 @@ async function updateLicenceFields({ licenceId, opticienId, patch = {} }) {
 app.post('/licence/expediteur', async (req, res) => {
   try {
     const { licenceId, opticienId, libelleExpediteur } = req.body || {};
-    if (!libelleExpediteur) {
-      return res.status(400).json({ success: false, error: 'LIBELLE_MANQUANT' });
-    }
+    if (!libelleExpediteur) return res.status(400).json({ success: false, error: 'LIBELLE_MANQUANT' });
 
-    // normalisation: alphanum, 3..11 chars
     const cleaned = String(libelleExpediteur).replace(/[^a-zA-Z0-9]/g, '').slice(0, 11);
-    if (cleaned.length < 3) {
-      return res.status(400).json({ success: false, error: 'LIBELLE_INVALIDE' });
-    }
+    if (cleaned.length < 3) return res.status(400).json({ success: false, error: 'LIBELLE_INVALIDE' });
 
     const { list, rawRecord } = await jsonbinGetAll();
 
     let found = { idx: -1, licence: null };
-    if (licenceId) {
-      found = findLicenceIndex(list, l => String(l.id) === String(licenceId));
-    } else if (opticienId) {
-      found = findLicenceIndex(list, l => String(l.opticien?.id) === String(opticienId));
-    }
-    if (found.idx === -1) {
-      return res.status(404).json({ success: false, error: 'LICENCE_INTRouvable' });
-    }
+    if (licenceId) found = findLicenceIndex(list, l => String(l.id) === String(licenceId));
+    else if (opticienId) found = findLicenceIndex(list, l => String(l.opticien?.id) === String(opticienId));
+    if (found.idx === -1) return res.status(404).json({ success: false, error: 'LICENCE_INTRouvable' });
 
     list[found.idx].libelleExpediteur = cleaned;
-
     const bodyToPut = Array.isArray(rawRecord) ? list : list[found.idx];
     await jsonbinPutAll(bodyToPut);
 
@@ -238,9 +227,7 @@ app.post('/licence/expediteur', async (req, res) => {
 app.post('/licence/signature', async (req, res) => {
   try {
     const { licenceId, opticienId, signature } = req.body || {};
-    if (typeof signature !== 'string') {
-      return res.status(400).json({ success: false, error: 'SIGNATURE_MANQUANTE' });
-    }
+    if (typeof signature !== 'string') return res.status(400).json({ success: false, error: 'SIGNATURE_MANQUANTE' });
 
     const clean = String(signature).trim().slice(0, 200);
 
@@ -250,9 +237,7 @@ app.post('/licence/signature', async (req, res) => {
       patch: { signature: clean },
     });
 
-    if (!result.ok) {
-      return res.status(result.status || 500).json({ success: false, error: result.error });
-    }
+    if (!result.ok) return res.status(result.status || 500).json({ success: false, error: result.error });
     return res.json({ success: true, licence: result.licence });
   } catch (e) {
     console.error('❌ /licence/signature error:', e);
@@ -291,7 +276,7 @@ app.get('/licence/cgv-status', async (req, res) => {
   }
 });
 
-// 2) Enregistrement de l’acceptation CGV
+// 2) Acceptation CGV
 app.post('/licence/cgv-accept', async (req, res) => {
   try {
     const { licenceId, version, textHash } = req.body || {};
@@ -524,7 +509,6 @@ app.get('/validation-mandat', async (req, res) => {
       customerId
     };
 
-    // Sauvegarde JSONBin
     const binId = must(JSONBIN_BIN_ID, 'JSONBIN_BIN_ID');
     const apiKey = must(JSONBIN_KEY, 'JSONBIN_KEY');
 
@@ -601,22 +585,17 @@ app.get('/validation-mandat', async (req, res) => {
 // ==== Helpers SMS & conformité ====
 const crypto = require('crypto');
 
-// anti spam léger par (licenceId, numéro)
 const lastSent = new Map();
 const MIN_INTERVAL_MS = 15 * 1000;
 
 function ymKey(d = new Date()) {
   return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;
 }
-function sha256Hex(s) {
-  return crypto.createHash('sha256').update(String(s)).digest('hex');
-}
-function normalizeFR(msisdn='') {
-  return toFRNumber(msisdn).replace(/\D/g,'');
-}
+function sha256Hex(s) { return crypto.createHash('sha256').update(String(s)).digest('hex'); }
+function normalizeFR(msisdn='') { return toFRNumber(msisdn).replace(/\D/g,''); }
 function isQuietHours(date = new Date()) {
   const paris = new Date(date.toLocaleString('en-US', { timeZone: 'Europe/Paris' }));
-  const day = paris.getDay();  // 0=Dim..6=Sam
+  const day = paris.getDay();
   const hour = paris.getHours();
   return (day === 0) || (hour < 8) || (hour >= 20);
 }
@@ -631,9 +610,7 @@ function isOptedOut(licence, numeroE164) {
   if (c && c.unsubscribedAt) return true;
   return false;
 }
-function hmacShort(input='') {
-  return crypto.createHash('sha256').update(String(input)).digest('hex').slice(0,16);
-}
+function hmacShort(input='') { return crypto.createHash('sha256').update(String(input)).digest('hex').slice(0,16); }
 function buildUnsubLink(licenceId, phoneE164) {
   const token = hmacShort(`${licenceId}:${phoneE164}`);
   const base = process.env.PUBLIC_SERVER_BASE || 'https://opticom-sms-server.onrender.com';
@@ -656,7 +633,7 @@ async function appendSmsLogAndPersist({ list, rawRecord, idx, licence, entry }) 
   await jsonbinPutAll(bodyToPut);
 }
 
-// --- Routes opt-out ---
+// --- Opt-out
 app.get('/unsubscribe', async (req, res) => {
   try {
     const licenceId = String(req.query.l || '');
@@ -681,7 +658,7 @@ app.get('/unsubscribe', async (req, res) => {
   }
 });
 
-// --- Admin Opt-out ---
+// --- Admin Opt-out
 app.get('/api/optouts/export', requireAdminToken, async (req, res) => {
   try {
     const { licenceId } = req.query || {};
@@ -797,7 +774,6 @@ async function sendSmsTransactional(req, res) {
 
     const numero = toFRNumber(phoneNumber);
 
-    // ⏱️ anti-spam 15s par (licence, numéro)
     const rlKey = `${licence.id}:${normalizeFR(numero)}`;
     const last = lastSent.get(rlKey) || 0;
     if (Date.now() - last < MIN_INTERVAL_MS) {
@@ -865,7 +841,7 @@ async function sendSmsTransactional(req, res) {
 app.post('/send-sms', applySenderAndSignature, sendSmsTransactional);
 app.post('/send-transactional', applySenderAndSignature, sendSmsTransactional);
 
-// Alias promotionnel
+// Promotionnel
 app.post('/send-promotional', applySenderAndSignature, async (req, res) => {
   const { phoneNumber, message, licenceId, opticienId, marketingConsent } = req.body || {};
 
@@ -1104,7 +1080,7 @@ app.post('/create-checkout-session', async (req, res) => {
   }
 });
 
-// ⚠️ webhook: raw UNIQUEMENT sur la route
+// ⚠️ Webhook Stripe en RAW UNIQUEMENT
 app.post('/webhook-stripe', express.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
   const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
@@ -1128,7 +1104,7 @@ app.post('/webhook-stripe', express.raw({ type: 'application/json' }), async (re
           const creditsAjoutes = 100 * quantity;
           list[idx].credits = (Number(list[idx].credits) || 0) + creditsAjoutes;
 
-          // Générer facture PDF
+          // facture PDF
           const facturePayload = {
             opticien: list[idx].opticien,
             type: 'Achat de crédits SMS (Stripe)',
@@ -1175,13 +1151,8 @@ app.post('/webhook-stripe', express.raw({ type: 'application/json' }), async (re
 // =======================
 //   Licences - API
 // =======================
+function normKey(s = '') { return String(s).replace(/[\s-]/g, '').toUpperCase(); }
 
-// Normalisation tolérante pour comparaison de clés
-function normKey(s = '') {
-  return String(s).replace(/[\s-]/g, '').toUpperCase();
-}
-
-// Recherche générique
 async function findLicence({ cle, id }) {
   const { list } = await jsonbinGetAll();
   if (id) {
@@ -1196,11 +1167,10 @@ async function findLicence({ cle, id }) {
   return null;
 }
 
-// ✅ Route unifiée + alias rétrocompat
 app.get(['/api/licence/by-key', '/licence/by-key', '/licence-by-key', '/api/licence', '/licence'], async (req, res) => {
   try {
     const cle = req.query.cle || req.query.key || req.query.k;
-    const id  = req.query.id; // optionnel
+    const id  = req.query.id;
     if (!cle && !id) return res.status(400).json({ error: 'Paramètre cle ou id requis' });
 
     const licence = await findLicence({ cle, id });
@@ -1214,8 +1184,7 @@ app.get(['/api/licence/by-key', '/licence/by-key', '/licence-by-key', '/api/lice
   }
 });
 
-// Expose la liste (lecture seule)
-app.get('/api/licences', async (req, res) => {
+app.get('/api/licences', async (_req, res) => {
   try {
     const { list } = await jsonbinGetAll();
     res.json(Array.isArray(list) ? list : (list ? [list] : []));
@@ -1226,7 +1195,7 @@ app.get('/api/licences', async (req, res) => {
 });
 
 // =======================
-//   Préférences auto (NEW)
+//   Préférences auto
 // =======================
 app.get('/api/licence/prefs', async (req, res) => {
   try {
@@ -1290,7 +1259,7 @@ app.post('/api/licence/prefs', async (req, res) => {
 //   CRON formules / résiliation
 // =======================
 const cron = require('node-cron');
-const ISO = (d = new Date()) => d.toISOString().slice(0, 10); // YYYY-MM-DD
+const ISO = (d = new Date()) => d.toISOString().slice(0, 10);
 const TARIFS_GC = { Starter: 600, Pro: 1200, Premium: 1800 };
 
 cron.schedule('0 3 * * *', async () => {
@@ -1304,7 +1273,6 @@ cron.schedule('0 3 * * *', async () => {
     for (let i = 0; i < list.length; i++) {
       const licence = list[i];
 
-      // 1) Changement de formule
       if (licence.nouvelleFormule && licence.dateChangement) {
         if (today >= String(licence.dateChangement).slice(0, 10)) {
           const newPlan = String(licence.nouvelleFormule);
@@ -1335,7 +1303,6 @@ cron.schedule('0 3 * * *', async () => {
         }
       }
 
-      // 2) Résiliation programmée (accepte dateResiliation ou resiliationDate)
       const resiDate = licence.dateResiliation || licence.resiliationDate;
       if (resiDate) {
         const cut = String(resiDate).slice(0, 10);
@@ -1370,10 +1337,9 @@ cron.schedule('0 3 * * *', async () => {
             console.error('❌ GC cancel (subscription/mandate):', e);
           }
 
-          // Désactivation
           licence.active = false;
-          delete licence.licence; // optionnel: retirer la clé d’accès
-          delete licence.credits; // optionnel
+          delete licence.licence;
+          delete licence.credits;
           updated = true;
         }
       }
@@ -1391,14 +1357,9 @@ cron.schedule('0 3 * * *', async () => {
 });
 
 // =======================
-//   Automatisation (NEW)
-//   - Anniversaire (jour J)
-//   - Renouvellement lentilles : J-10 (configurable via lensAdvanceDays)
+//   Automatisations
 // =======================
-
-// ====== Helpers dates (Europe/Paris) ======
 const PARIS_TZ = 'Europe/Paris';
-
 function isoTodayParis() {
   const d = new Date(new Date().toLocaleString('en-US', { timeZone: PARIS_TZ }));
   const y = d.getFullYear();
@@ -1406,23 +1367,17 @@ function isoTodayParis() {
   const day = String(d.getDate()).padStart(2,'0');
   return `${y}-${m}-${day}`;
 }
-
-// "YYYY-MM-DD" -> Date (UTC) à minuit
 function dateFromISO(iso) {
   const [y,m,d] = String(iso).split('-').map(Number);
   if (!y || !m || !d) return null;
   return new Date(Date.UTC(y, m-1, d, 0, 0, 0));
 }
-
-// "DD/MM/YYYY" -> "YYYY-MM-DD"
 function frToISO(s) {
   const m = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(String(s).trim());
   if (!m) return null;
   const [_, dd, mm, yyyy] = m;
   return `${yyyy}-${mm}-${dd}`;
 }
-
-// parse "YYYY-MM-DD" OU "DD/MM/YYYY" -> "YYYY-MM-DD"
 function parseToISODate(s) {
   if (!s) return null;
   const str = String(s).trim();
@@ -1430,14 +1385,12 @@ function parseToISODate(s) {
   const fr = frToISO(str);
   return fr || null;
 }
-
 function addDaysISO(iso, days) {
   const d = dateFromISO(iso);
   if (!d) return null;
   d.setUTCDate(d.getUTCDate() + Number(days || 0));
   return d.toISOString().slice(0,10);
 }
-
 function addMonthsISO(iso, months) {
   const d = dateFromISO(iso);
   if (!d) return null;
@@ -1451,34 +1404,20 @@ function addMonthsISO(iso, months) {
   d.setUTCFullYear(targetY, targetMonth, Math.min(day, lastDay));
   return d.toISOString().slice(0,10);
 }
-
-// STOP 36111 si absent
-function ensureStopMention(text) {
-  return /stop\s+au\s+36111/i.test(text) ? text : `${text}\nSTOP au 36111`;
-}
-
-// interpolation simple {prenom} {nom}
+function ensureStopMention(text) { return /stop\s+au\s+36111/i.test(text) ? text : `${text}\nSTOP au 36111`; }
 function renderTemplate(tpl, ctx) {
   return String(tpl || '')
     .replace(/\{prenom\}/gi, ctx.prenom || '')
     .replace(/\{nom\}/gi, ctx.nom || '');
 }
-
 function sameMonthDay(dateStr) {
   const iso = parseToISODate(dateStr);
   if (!iso) return false;
   const today = isoTodayParis();
   return today.slice(5) === iso.slice(5);
 }
-
-// lecture numéro client
-function pickClientPhone(c) {
-  return c?.phone || c?.telephone || c?.mobile || c?.gsm || '';
-}
-
-// calcul de la date "fin de lentilles"
+function pickClientPhone(c) { return c?.phone || c?.telephone || c?.mobile || c?.gsm || ''; }
 function computeLensEndISO(client) {
-  // 1) fin explicite
   const end =
     parseToISODate(client?.nextLensRenewal) ||
     parseToISODate(client?.renouvellementLentilles) ||
@@ -1486,7 +1425,6 @@ function computeLensEndISO(client) {
     parseToISODate(client?.lensEndDate);
   if (end) return end;
 
-  // 2) début + durée
   const start =
     parseToISODate(client?.lensStartDate) ||
     parseToISODate(client?.dateDernieresLentilles) ||
@@ -1509,7 +1447,6 @@ function computeLensEndISO(client) {
   if (days > 0) return addDaysISO(start, days);
   if (months > 0) return addMonthsISO(start, months);
 
-  // 3) durée textuelle "90", "90j", "6", "6m"
   const raw = String(client?.lensDuration || client?.dureeLentilles || '').trim().toLowerCase();
   if (raw) {
     const mJ = /^(\d+)\s*j/.exec(raw);
@@ -1517,19 +1454,14 @@ function computeLensEndISO(client) {
     if (mJ) return addDaysISO(start, Number(mJ[1]));
     if (mM) return addMonthsISO(start, Number(mM[1]));
     const n = Number(raw);
-    if (Number.isFinite(n) && n > 0) {
-      // par défaut on interprète comme jours
-      return addDaysISO(start, n);
-    }
+    if (Number.isFinite(n) && n > 0) return addDaysISO(start, n);
   }
   return null;
 }
 
-// envoi réel (SMSMode) + décrément + logs + anti-doublon
 async function sendSmsAutoForLicence({ licence, list, rawRecord, idx, numero, text, type }) {
   if (!process.env.SMSMODE_LOGIN || !process.env.SMSMODE_PASSWORD) return { ok:false, reason:'SMSMODE_ENV_MISSING' };
 
-  // anti double envoi très rapproché (licence, numéro)
   const numeroE164 = toFRNumber(numero);
   const rlKey = `${licence.id}:${normalizeFR(numeroE164)}`;
   const last = lastSent.get(rlKey) || 0;
@@ -1581,7 +1513,6 @@ async function sendSmsAutoForLicence({ licence, list, rawRecord, idx, numero, te
   return { ok:true };
 }
 
-// Tous les jours à 09:15 Europe/Paris
 cron.schedule('15 9 * * *', async () => {
   const todayISO = isoTodayParis();
   console.log('⏳ CRON: automatisations (anniv / lentilles J-10)…', todayISO);
@@ -1600,7 +1531,7 @@ cron.schedule('15 9 * * *', async () => {
 
       licence.automationLog = Array.isArray(licence.automationLog) ? licence.automationLog : [];
 
-      // ---------- Anniversaire (jour J) ----------
+      // Anniversaire
       if (a.autoBirthdayEnabled) {
         const tpl = a.messageBirthday || 'Joyeux anniversaire {prenom} !';
         for (const c of clients) {
@@ -1616,9 +1547,9 @@ cron.schedule('15 9 * * *', async () => {
         }
       }
 
-      // ---------- Renouvellement Lentilles J-10 ----------
+      // Renouvellement Lentilles J-10
       if (a.autoLensRenewalEnabled) {
-        const advance = Number.isFinite(+a.lensAdvanceDays) ? +a.lensAdvanceDays : 10; // J-10 par défaut
+        const advance = Number.isFinite(+a.lensAdvanceDays) ? +a.lensAdvanceDays : 10;
         const tpl = a.messageLensRenewal || 'Bonjour {prenom}, pensez au renouvellement de vos lentilles.';
         for (const c of clients) {
           const endISO = computeLensEndISO(c);
@@ -1650,7 +1581,7 @@ cron.schedule('15 9 * * *', async () => {
 }, { timezone: 'Europe/Paris' });
 
 // =======================
-//   Facture PDF (JSONBin)
+//   Facture PDF
 // =======================
 app.post('/api/generate-invoice', async (req, res) => {
   const { opticien, type, montant, details } = req.body || {};
@@ -1691,7 +1622,126 @@ app.post('/api/generate-invoice', async (req, res) => {
   });
 });
 
-// Petit ping JSON brut pour debug local
+// =======================
+//   FEEDBACK (contact / suggestions)
+//   - POST /feedback (et /api/feedback)
+//   - GET /api/admin/feedback (admin)
+//   - PATCH /api/admin/feedback/:id (admin)
+// =======================
+function flattenFeedbacks(list) {
+  const out = [];
+  for (const lic of list) {
+    const items = Array.isArray(lic.feedbacks) ? lic.feedbacks : [];
+    for (const fb of items) {
+      out.push({ ...fb, licenceId: lic.id, opticien: lic.opticien || {} });
+    }
+  }
+  return out;
+}
+
+app.post(['/feedback', '/api/feedback'], async (req, res) => {
+  try {
+    const { licenceId, subject, message, email, platform, opticien } = req.body || {};
+    if (!message || String(message).trim().length < 10) {
+      return res.status(400).json({ ok: false, error: 'MESSAGE_TOO_SHORT' });
+    }
+    if (!licenceId) {
+      return res.status(400).json({ ok: false, error: 'LICENCE_ID_REQUIS' });
+    }
+
+    const { list, rawRecord } = await jsonbinGetAll();
+    const { idx, licence } = findLicenceIndex(list, l => String(l.id) === String(licenceId));
+    if (idx === -1) return res.status(404).json({ ok: false, error: 'LICENCE_INTROUVABLE' });
+
+    const fb = {
+      id: uuidv4(),
+      subject: (subject && String(subject).trim()) || 'Suggestion / Contact',
+      message: String(message).trim(),
+      email: (email && String(email).trim()) || '',
+      platform: (platform && String(platform).trim()) || '',
+      status: 'open',
+      adminNotes: '',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      opticien: opticien || { enseigne: licence.opticien?.enseigne || '', ville: licence.opticien?.ville || '' },
+    };
+
+    if (!Array.isArray(licence.feedbacks)) licence.feedbacks = [];
+    licence.feedbacks.unshift(fb); // en tête
+
+    const bodyToPut = Array.isArray(rawRecord) ? (list[idx] = licence, list) : licence;
+    await jsonbinPutAll(bodyToPut);
+
+    return res.json({ ok: true, id: fb.id });
+  } catch (e) {
+    console.error('❌ POST /feedback error:', e);
+    return res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
+  }
+});
+
+app.get('/api/admin/feedback', requireAdminToken, async (req, res) => {
+  try {
+    const { status, q, skip = '0', limit = '50' } = req.query || {};
+    const { list } = await jsonbinGetAll();
+    let items = flattenFeedbacks(list);
+
+    if (status) items = items.filter(it => it.status === status);
+    if (q) {
+      const rx = new RegExp(String(q), 'i');
+      items = items.filter(it =>
+        rx.test(it.message) || rx.test(it.subject) || rx.test(it.email) || rx.test(it.licenceId) ||
+        rx.test(it.opticien?.enseigne || '')
+      );
+    }
+
+    items.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    const s = Math.max(0, parseInt(skip));
+    const l = Math.min(200, Math.max(1, parseInt(limit)));
+    const slice = items.slice(s, s + l);
+
+    res.json({ ok: true, total: items.length, items: slice });
+  } catch (e) {
+    console.error('❌ GET /api/admin/feedback error:', e);
+    res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
+  }
+});
+
+app.patch('/api/admin/feedback/:id', requireAdminToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status, adminNotes, handledBy } = req.body || {};
+
+    const { list, rawRecord } = await jsonbinGetAll();
+    let updated = null;
+
+    for (let i = 0; i < list.length; i++) {
+      const licence = list[i];
+      const arr = Array.isArray(licence.feedbacks) ? licence.feedbacks : [];
+      const j = arr.findIndex(f => f.id === id);
+      if (j >= 0) {
+        if (status) arr[j].status = status;
+        if (typeof adminNotes === 'string') arr[j].adminNotes = adminNotes;
+        if (typeof handledBy === 'string') arr[j].handledBy = handledBy;
+        if (status === 'closed') arr[j].handledAt = new Date().toISOString();
+        arr[j].updatedAt = new Date().toISOString();
+        licence.feedbacks = arr;
+        updated = { licenceId: licence.id, item: arr[j] };
+        list[i] = licence;
+        break;
+      }
+    }
+
+    if (!updated) return res.status(404).json({ ok: false, error: 'NOT_FOUND' });
+
+    await jsonbinPutAll(Array.isArray(rawRecord) ? list : list[0] || {});
+    res.json({ ok: true, ...updated });
+  } catch (e) {
+    console.error('❌ PATCH /api/admin/feedback/:id error:', e);
+    res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
+  }
+});
+
+// Petit ping JSON brut
 app.get('/api/ping', (_, res) => res.json({ ok: true }));
 
 // =======================
