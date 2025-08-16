@@ -461,7 +461,7 @@ app.post('/create-mandat', async (req, res) => {
   }
 });
 
-app.get('/validation-mandat', async (req, res) => {
+app.get('/validation-mandat', async (req, res) => { 
   const redirectFlowId = req.query.redirect_flow_id;
   const sessionToken   = req.query.session_token;
   if (!redirectFlowId || !sessionToken) {
@@ -551,42 +551,80 @@ app.get('/validation-mandat', async (req, res) => {
       return res.json(newLicence);
     }
 
+    // === URL de retour vers la PWA (ou fallback deeplink natif) ===
+    const APP_URL = (process.env.PUBLIC_APP_URL || process.env.PUBLIC_WEB_APP_URL || '').trim();
+    const appBase = APP_URL.replace(/\/+$/, ''); // sans slash de fin
+    const webDeeplink = appBase ? `${appBase}/licence?licence=${encodeURIComponent(licenceKey)}` : '';
+    const schemeDeeplink = `opticom://licence?licence=${encodeURIComponent(licenceKey)}`;
+
     res.send(`
       <html>
         <head>
           <title>Licence validée</title>
           <meta charset="utf-8" />
+          <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
           <style>
-            body { font-family: sans-serif; padding: 30px; background: #f7f7f7; }
-            .box { background: white; border-radius: 10px; padding: 20px; box-shadow: 0 0 10px rgba(0,0,0,0.1); max-width: 640px; margin: 0 auto; }
-            h1 { color: #2e7d32; }
-            code { background: #eee; padding: 5px 10px; font-size: 1.2em; border-radius: 5px; }
-            .row { display: flex; align-items: center; gap: 10px; }
-            .copy-btn { padding: 6px 10px; border: none; background: #2e7d32; color: #fff; border-radius: 6px; cursor: pointer; }
-            .copy-btn:hover { background: #256628; }
-            .hint { color: #666; font-size: 0.95em; }
+            :root { color-scheme: light dark; }
+            body { font-family: system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; padding: 24px; background: #0b0b0b; color: #fff; }
+            .box { background: #141414; border-radius: 14px; padding: 20px; max-width: 680px; margin: 0 auto; border: 1px solid #2a2a2a; }
+            h1 { color: #2e7d32; margin: 0 0 10px; font-size: 22px; }
+            .hint { color: #aaa; font-size: 14px; margin: 0 0 10px; }
+            .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+            code { background: #1e1e1e; border: 1px solid #333; padding: 8px 12px; font-size: 16px; border-radius: 8px; }
+            .btn { display:inline-block; padding: 10px 14px; border-radius: 10px; text-decoration: none; border: 0; cursor: pointer; font-weight: 600; }
+            .btn-copy { background:#2e7d32; color:#fff; }
+            .btn-copy:hover { filter: brightness(1.05); }
+            .btn-return { background:#1E90FF; color:#fff; margin: 14px auto 0; display:block; text-align:center; width:max-content; }
+            .small { font-size: 13px; color:#9aa; margin-top:6px; text-align:center; }
           </style>
         </head>
         <body>
           <div class="box">
-            <h1>🎉 Votre mandat est validé !</h1>
+            <h1>🎉 Mandat validé</h1>
             <p class="hint">Voici votre clé de licence :</p>
-            <p class="row">
+            <div class="row">
               <code id="licenceKey">${licenceKey}</code>
-              <button class="copy-btn" onclick="copyLicence()">📋 Copier</button>
-            </p>
-            <p>Vous pouvez maintenant retourner dans l'application OptiCOM et la saisir dans l'onglet <strong>« J'ai déjà une licence »</strong>.</p>
+              <button class="btn btn-copy" onclick="copyLicence()">📋 Copier</button>
+            </div>
+
+            <p class="small" id="autoMsg">La clé a été copiée. Redirection automatique dans <span id="sec">5</span>&nbsp;s…</p>
+
+            <a id="returnBtn" class="btn btn-return" href="${webDeeplink || schemeDeeplink}">
+              ↩️ Retourner dans l’application
+            </a>
           </div>
 
           <script>
-            function copyLicence() {
-              const txt = document.getElementById('licenceKey').textContent;
-              navigator.clipboard.writeText(txt).then(() => {
+            async function copyLicence() {
+              try {
+                const txt = document.getElementById('licenceKey').textContent;
+                await navigator.clipboard.writeText(txt);
                 alert('Clé copiée !');
-              }).catch(err => {
-                alert('Impossible de copier la clé : ' + err);
-              });
+              } catch (e) {
+                alert('Impossible de copier la clé : ' + e);
+              }
             }
+
+            (async function init() {
+              // Copie auto silencieuse
+              try {
+                const txt = document.getElementById('licenceKey').textContent;
+                await navigator.clipboard.writeText(txt);
+              } catch (e) {}
+
+              // Compte à rebours + redirection
+              var s = 5;
+              var el = document.getElementById('sec');
+              var timer = setInterval(function(){
+                s--; if (el) el.textContent = String(s);
+                if (s <= 0) { clearInterval(timer); go(); }
+              }, 1000);
+
+              function go(){
+                var target = ${JSON.stringify(webDeeplink || '')} || ${JSON.stringify(schemeDeeplink)};
+                window.location.href = target;
+              }
+            })();
           </script>
         </body>
       </html>
@@ -596,6 +634,7 @@ app.get('/validation-mandat', async (req, res) => {
     res.status(500).send('Erreur lors de la validation du mandat.');
   }
 });
+
 
 // ==== Helpers SMS & conformité ====
 const crypto = require('crypto');
