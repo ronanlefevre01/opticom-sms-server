@@ -96,7 +96,10 @@ const corsOptions = {
 };
 app.use((req, res, next) => { res.setHeader('Vary', 'Origin'); next(); });
 app.use(cors(corsOptions));
-app.options('(.*)', cors(corsOptions)); // Express 5: wildcard correct
+
+// option B (recommandée, RegExp) :
+app.options(/.*/, cors(corsOptions));
+
 
 
 // --- Cookies
