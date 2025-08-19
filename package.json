@@ -1,27 +1,31 @@
 {
   "name": "opticom-sms-server",
   "version": "1.0.0",
+  "private": true,
+  "description": "Serveur OptiCOM (SMS, GoCardless, Stripe, factures, JSONBin proxy & data sync).",
   "main": "index.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18.18.0"
+  },
   "scripts": {
     "start": "node index.js",
-    "dev": "nodemon index.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "dev": "nodemon --env-file .env index.js",
+    "test": "echo \"No tests yet\" && exit 0"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "description": "",
   "dependencies": {
     "axios": "^1.11.0",
-    "body-parser": "^2.2.0",
+    "body-parser": "^1.20.2",
     "cookie-parser": "^1.4.7",
     "cors": "^2.8.5",
-    "dotenv": "^17.2.1",
+    "dotenv": "^16.4.5",
     "express": "^5.1.0",
     "gocardless-nodejs": "^6.0.0",
     "multer": "^2.0.2",
     "node-cron": "^4.2.1",
-    "node-fetch": "^3.3.2",
     "nodemailer": "^7.0.5",
     "pdfkit": "^0.17.1",
     "raw-body": "^3.0.0",
@@ -29,6 +33,6 @@
     "uuid": "^11.1.0"
   },
   "devDependencies": {
-    "nodemon": "^3.0.0"
+    "nodemon": "^3.1.0"
   }
 }

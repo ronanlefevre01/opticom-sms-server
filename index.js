@@ -1,7 +1,7 @@
 require('dotenv').config();
 
 const express = require('express');
-const bodyParser = require('body-parser');
+const bodyParser = require('body-parser'); // on garde body-parser pour tout sauf le webhook Stripe (RAW)
 const fs = require('fs');
 const cors = require('cors');
 const path = require('path');
@@ -14,15 +14,16 @@ const { URLSearchParams } = require('url');
 const multer = require('multer');
 const cryptoNode = require('crypto');
 
+// --- Routes/Services externes existants
 const licenceRoutes = require('./routes/licence.routes');
 const purgeRoutes = require('./routes/purge.routes');
 const { schedulePurge } = require('./services/purgeService');
 
-// --- JSONBin config
+// --- JSONBin (BIN licences)
 const JSONBIN_BIN_ID = process.env.JSONBIN_BIN_ID;
 const JSONBIN_KEY = process.env.JSONBIN_MASTER_KEY || process.env.JSONBIN_API_KEY;
 
-// ---- CGV
+// --- CGV
 const CGV_VERSION = process.env.CGV_VERSION || '2025-08-14';
 const CGV_FILE = path.join(__dirname, 'public', 'legal', `cgv-${CGV_VERSION}.md`);
 
@@ -35,32 +36,33 @@ try {
   console.warn('⚠️ CGV file not found. You can still use env CGV_TEXT_HASH if provided.');
 }
 
-// fetch ESM
-const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
+// --- Node 18+ : fetch natif
+const fetch = globalThis.fetch.bind(globalThis);
 
 const app = express();
-app.set('trust proxy', true); // important derrière Render/NGINX
+app.set('trust proxy', 1); // important derrière Render/NGINX
 const PORT = process.env.PORT || 3001;
 
+// --- Stripe / GoCardless
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const GO_CARDLESS_API_BASE = 'https://api.gocardless.com';
-
 const goCardlessClient = goCardless(
   process.env.GOCARDLESS_API_KEY,
   process.env.GOCARDLESS_ENV || 'live'
 );
 
+// --- Sessions simples en mémoire
 const sessionTokenMap = new Map();
 
-// --- Formules ---
+// --- Formules
 const formulas = [
   { id: 'starter', name: 'Starter', credits: 100 },
   { id: 'pro', name: 'Pro', credits: 300 },
   { id: 'premium', name: 'Premium', credits: 600 },
-  { id: 'alacarte', name: 'À la carte', credits: 0 },
+  { id: 'alacarte', name: 'À la carte', credits: 0 }
 ];
 
-// --- Dossier factures public ---
+// --- Dossier factures public
 const factureDir = path.join(__dirname, 'public/factures');
 if (!fs.existsSync(factureDir)) fs.mkdirSync(factureDir, { recursive: true });
 
@@ -72,33 +74,65 @@ app.use(
     setHeaders: (res) => {
       res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
       res.setHeader('Content-Disposition', 'inline');
-    },
+    }
   })
 );
 
-// --- Middlewares globaux ---
-app.use(cors());
+// --- CORS dynamique
+const allowedOrigins = [
+  'https://opticom-web.vercel.app',
+  'https://opti-admin.vercel.app',
+  'http://localhost:5173',
+  'http://localhost:3000'
+];
+const corsOptions = {
+  origin(origin, cb) {
+    if (!origin) return cb(null, true); // cURL / Postman
+    cb(allowedOrigins.includes(origin) ? null : new Error('Not allowed by CORS'), allowedOrigins.includes(origin));
+  },
+  methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true
+};
+app.use((req, res, next) => { res.setHeader('Vary', 'Origin'); next(); });
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
+
+// --- Cookies
 app.use(cookieParser());
 
-// ⛔️ Garanti: pas de JSON parser pour /webhook-stripe (Stripe exige RAW)
+// ⛔️ Stripe exige RAW: on évite le JSON parser sur /webhook-stripe
 app.use((req, res, next) => {
   if (req.originalUrl === '/webhook-stripe') return next();
-  return bodyParser.json()(req, res, next);
+  return bodyParser.json({ limit: '2mb' })(req, res, next);
 });
 
-app.use(express.static('public'));
+// --- Statiques généraux
+app.use('/public', express.static('public'));
 
-// Routes modules
+// --- Route de test JSONBin data (temporaire, si présente)
+try {
+  app.use(require('./routes/_devJsonbinTest'));
+} catch (e) {
+  // silencieux si la route n'existe pas en prod
+}
+
+// --- Routes modules existants
 app.use('/api', licenceRoutes);
 app.use('/api', purgeRoutes);
 
-// CRON quotidien à 03:00 Europe/Paris
+// --- CRON purge quotidienne (03:00 Europe/Paris)
 schedulePurge();
 
-// --- Ping ---
-app.get('/', (_, res) => res.send('✅ Serveur OptiCOM en ligne'));
+// --- Ping
+app.get('/', (_req, res) => res.json({
+  ok: true,
+  service: 'opticom-sms-server',
+  node: process.version,
+  time: new Date().toISOString()
+}));
 
-// ===== Upload facture PDF (protégé par token) =====
+// ===== Upload facture PDF (protégé par token)
 const ADMIN_UPLOAD_TOKEN = process.env.ADMIN_UPLOAD_TOKEN;
 function requireAdminToken(req, res, next) {
   if (!ADMIN_UPLOAD_TOKEN) return res.status(500).json({ error: 'ADMIN_UPLOAD_TOKEN manquant côté serveur' });
@@ -106,21 +140,19 @@ function requireAdminToken(req, res, next) {
   if (auth !== `Bearer ${ADMIN_UPLOAD_TOKEN}`) return res.status(401).json({ error: 'unauthorized' });
   next();
 }
-
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, factureDir),
   filename: (req, _file, cb) => {
     const numero = (req.body.numero && String(req.body.numero).trim()) || uuidv4();
     const safe = numero.replace(/[^A-Za-z0-9-_]/g, '_');
     cb(null, `${safe}.pdf`);
-  },
+  }
 });
 const upload = multer({
   storage,
   limits: { fileSize: 15 * 1024 * 1024 },
-  fileFilter: (_req, file, cb) => cb(null, file.mimetype === 'application/pdf'),
+  fileFilter: (_req, file, cb) => cb(null, file.mimetype === 'application/pdf')
 });
-
 app.post('/api/upload-facture', requireAdminToken, upload.single('pdf'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: "Fichier PDF manquant (champ 'pdf')." });
   const numero = String(req.body.numero || path.basename(req.file.filename, '.pdf'));
@@ -129,7 +161,7 @@ app.post('/api/upload-facture', requireAdminToken, upload.single('pdf'), (req, r
 });
 
 // =======================
-//   JSONBIN HELPERS
+//   JSONBIN HELPERS (BIN licences)
 // =======================
 const must = (v, name) => { if (!v) throw new Error(`${name} manquant.`); return v; };
 
@@ -157,7 +189,7 @@ async function jsonbinPutAll(body) {
   const r = await fetch(`https://api.jsonbin.io/v3/b/${binId}`, {
     method: 'PUT',
     headers,
-    body: JSON.stringify(body),
+    body: JSON.stringify(body)
   });
   if (!r.ok) {
     const t = await r.text().catch(() => '');
@@ -169,8 +201,6 @@ function findLicenceIndex(list, predicate) {
   const idx = list.findIndex(predicate);
   return { idx, licence: idx >= 0 ? list[idx] : null };
 }
-
-// Recherche licence par plusieurs identifiants possibles (id, licence, opticien.id)
 function findLicenceIndexByAnyId(list, licenceId) {
   const K = String(licenceId || '').trim();
   return findLicenceIndex(
@@ -217,7 +247,6 @@ app.post('/licence/expediteur', async (req, res) => {
     if (cleaned.length < 3) return res.status(400).json({ success: false, error: 'LIBELLE_INVALIDE' });
 
     const { list, rawRecord } = await jsonbinGetAll();
-
     let found = { idx: -1, licence: null };
     if (licenceId) found = findLicenceIndex(list, l => String(l.id) === String(licenceId));
     else if (opticienId) found = findLicenceIndex(list, l => String(l.opticien?.id) === String(opticienId));
@@ -247,7 +276,7 @@ app.post('/licence/signature', async (req, res) => {
     const result = await updateLicenceFields({
       licenceId,
       opticienId,
-      patch: { signature: clean },
+      patch: { signature: clean }
     });
 
     if (!result.ok) return res.status(result.status || 500).json({ success: false, error: result.error });
@@ -258,7 +287,9 @@ app.post('/licence/signature', async (req, res) => {
   }
 });
 
-// 1) Statut d’acceptation CGV
+// =======================
+//   CGV status / accept
+// =======================
 app.get('/licence/cgv-status', async (req, res) => {
   try {
     const { licenceId } = req.query || {};
@@ -283,7 +314,7 @@ app.get('/licence/cgv-status', async (req, res) => {
       acceptedVersion: licence.cgv?.version || null,
       acceptedAt: licence.cgv?.acceptedAt || null,
       textUrl: absoluteUrl,
-      serverTextHash: CGV_TEXT_HASH || null,
+      serverTextHash: CGV_TEXT_HASH || null
     });
   } catch (e) {
     console.error('❌ /licence/cgv-status', e);
@@ -291,7 +322,6 @@ app.get('/licence/cgv-status', async (req, res) => {
   }
 });
 
-// 2) Acceptation CGV
 app.post('/licence/cgv-accept', async (req, res) => {
   try {
     const { licenceId, version, textHash } = req.body || {};
@@ -340,7 +370,7 @@ app.post('/licence/cgv-accept', async (req, res) => {
 });
 
 // =======================
-//   SMS & SIGNATURE
+//   SMS helpers
 // =======================
 function normalizeSender(raw = 'OptiCOM') {
   let s = String(raw).replace(/[^a-zA-Z0-9]/g, '');
@@ -423,7 +453,7 @@ app.post('/create-mandat', async (req, res) => {
       address_line1: adresse,
       city: ville,
       postal_code: codePostal,
-      country_code: pays || 'FR',
+      country_code: pays || 'FR'
     };
 
     const response = await fetch(`${GO_CARDLESS_API_BASE}/redirect_flows`, {
@@ -461,7 +491,7 @@ app.post('/create-mandat', async (req, res) => {
   }
 });
 
-app.get('/validation-mandat', async (req, res) => { 
+app.get('/validation-mandat', async (req, res) => {
   const redirectFlowId = req.query.redirect_flow_id;
   const sessionToken   = req.query.session_token;
   if (!redirectFlowId || !sessionToken) {
@@ -551,9 +581,8 @@ app.get('/validation-mandat', async (req, res) => {
       return res.json(newLicence);
     }
 
-    // === URL de retour vers la PWA (ou fallback deeplink natif) ===
     const APP_URL = (process.env.PUBLIC_APP_URL || process.env.PUBLIC_WEB_APP_URL || '').trim();
-    const appBase = APP_URL.replace(/\/+$/, ''); // sans slash de fin
+    const appBase = APP_URL.replace(/\/+$/, '');
     const webDeeplink = appBase ? `${appBase}/licence?licence=${encodeURIComponent(licenceKey)}` : '';
     const schemeDeeplink = `opticom://licence?licence=${encodeURIComponent(licenceKey)}`;
 
@@ -606,13 +635,11 @@ app.get('/validation-mandat', async (req, res) => {
             }
 
             (async function init() {
-              // Copie auto silencieuse
               try {
                 const txt = document.getElementById('licenceKey').textContent;
                 await navigator.clipboard.writeText(txt);
               } catch (e) {}
 
-              // Compte à rebours + redirection
               var s = 5;
               var el = document.getElementById('sec');
               var timer = setInterval(function(){
@@ -635,16 +662,13 @@ app.get('/validation-mandat', async (req, res) => {
   }
 });
 
-
 // ==== Helpers SMS & conformité ====
 const crypto = require('crypto');
 
 const lastSent = new Map();
 const MIN_INTERVAL_MS = 15 * 1000;
 
-function ymKey(d = new Date()) {
-  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;
-}
+function ymKey(d = new Date()) { return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`; }
 function sha256Hex(s) { return crypto.createHash('sha256').update(String(s)).digest('hex'); }
 function normalizeFR(msisdn='') { return toFRNumber(msisdn).replace(/\D/g,''); }
 function isQuietHours(date = new Date()) {
@@ -800,7 +824,7 @@ app.post('/consent', async (req, res) => {
 });
 
 // ============================
-//   Envoi SMS (JSONBin)
+//   Envoi SMS (transactionnel / promo)
 // ============================
 async function sendSmsTransactional(req, res) {
   const { phoneNumber, message, licenceId, opticienId } = req.body || {};
@@ -851,7 +875,7 @@ async function sendSmsTransactional(req, res) {
     const smsResp = await fetch('https://api.smsmode.com/http/1.6/sendSMS.do', {
       method:'POST',
       headers:{ 'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8' },
-      body: params.toString(),
+      body: params.toString()
     });
     const smsText = await smsResp.text();
 
@@ -895,7 +919,6 @@ async function sendSmsTransactional(req, res) {
 app.post('/send-sms', applySenderAndSignature, sendSmsTransactional);
 app.post('/send-transactional', applySenderAndSignature, sendSmsTransactional);
 
-// Promotionnel
 app.post('/send-promotional', applySenderAndSignature, async (req, res) => {
   const { phoneNumber, message, licenceId, opticienId, marketingConsent } = req.body || {};
 
@@ -962,7 +985,7 @@ app.post('/send-promotional', applySenderAndSignature, async (req, res) => {
     const smsResp = await fetch('https://api.smsmode.com/http/1.6/sendSMS.do', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
-      body: params.toString(),
+      body: params.toString()
     });
     const smsText = await smsResp.text();
 
@@ -989,8 +1012,8 @@ app.post('/send-promotional', applySenderAndSignature, async (req, res) => {
         textHash: sha256Hex(finalMessage),
         provider: 'smsmode',
         bytes: Buffer.byteLength(finalMessage, 'utf8'),
-        mois: ymKey(new Date()),
-      },
+        mois: ymKey(new Date())
+      }
     });
 
     return res.json({
@@ -998,7 +1021,7 @@ app.post('/send-promotional', applySenderAndSignature, async (req, res) => {
       licenceId: licence.id,
       sender,
       message: finalMessage,
-      credits: licence.credits,
+      credits: licence.credits
     });
   } catch (err) {
     console.error('Erreur /send-promotional:', err);
@@ -1009,10 +1032,8 @@ app.post('/send-promotional', applySenderAndSignature, async (req, res) => {
 // =======================
 //   SUPPORT / FEEDBACK
 // =======================
-const ADMIN_FEEDBACK_TOKEN =
-  process.env.ADMIN_FEEDBACK_TOKEN || process.env.ADMIN_UPLOAD_TOKEN;
+const ADMIN_FEEDBACK_TOKEN = process.env.ADMIN_FEEDBACK_TOKEN || process.env.ADMIN_UPLOAD_TOKEN;
 
-// Normalise un message au format "inbox"
 function makeInboxEntry(licence, { subject = '', message = '', email = '', platform = '', appVersion = '' }) {
   return {
     id: uuidv4(),
@@ -1023,43 +1044,38 @@ function makeInboxEntry(licence, { subject = '', message = '', email = '', platf
     email: String(email || '').slice(0, 200),
     platform: String(platform || '').slice(0, 32),
     appVersion: String(appVersion || '').slice(0, 32),
-    statut: 'nouveau', // "nouveau" | "traite"
+    statut: 'nouveau'
   };
 }
-
-// Récupère tous les messages (feedbackInbox + (legacy) feedbacks)
 function collectAllFeedbackRows(list) {
   const out = [];
   for (const lic of list) {
     const inbox = Array.isArray(lic.feedbackInbox) ? lic.feedbackInbox : [];
-    // legacy: feedbacks {status:'open'|'closed', ...}
-    const legacy = Array.isArray(lic.feedbacks) ? lic.feedbacks.map((f) => ({
-      id: f.id || uuidv4(),
-      date: f.createdAt || f.date || new Date().toISOString(),
-      licenceId: lic.id,
-      objet: f.subject || '',
-      message: f.message || '',
-      email: f.email || '',
-      platform: f.platform || '',
-      appVersion: f.appVersion || '',
-      statut: (f.status === 'closed') ? 'traite' : 'nouveau',
-    })) : [];
-
+    const legacy = Array.isArray(lic.feedbacks)
+      ? lic.feedbacks.map((f) => ({
+          id: f.id || uuidv4(),
+          date: f.createdAt || f.date || new Date().toISOString(),
+          licenceId: lic.id,
+          objet: f.subject || '',
+          message: f.message || '',
+          email: f.email || '',
+          platform: f.platform || '',
+          appVersion: f.appVersion || '',
+          statut: f.status === 'closed' ? 'traite' : 'nouveau'
+        }))
+      : [];
     for (const it of [...inbox, ...legacy]) {
       out.push({
         ...it,
         licence: lic.licence || lic.id,
         enseigne: lic.opticien?.enseigne || lic.opticien?.nom || '',
-        emailLicence: lic.opticien?.email || '',
+        emailLicence: lic.opticien?.email || ''
       });
     }
   }
-  // plus récent d'abord
   return out.sort((a, b) => (a.date < b.date ? 1 : -1));
 }
 
-// POST /support/messages  (alias: /api/support/messages)
-// body: { licenceId, subject?, message, email?, platform?, appVersion? }
 app.post(['/support/messages', '/api/support/messages'], async (req, res) => {
   try {
     const { licenceId, subject = '', message, email = '', platform = '', appVersion = '' } = req.body || {};
@@ -1071,7 +1087,6 @@ app.post(['/support/messages', '/api/support/messages'], async (req, res) => {
     const { idx, licence } = findLicenceIndexByAnyId(list, licenceId);
     if (idx === -1 || !licence) return res.status(404).json({ success: false, error: 'LICENCE_INTROUVABLE' });
 
-    // stocke dans la boîte unifiée
     licence.feedbackInbox = Array.isArray(licence.feedbackInbox) ? licence.feedbackInbox : [];
     const entry = makeInboxEntry(licence, { subject, message, email, platform, appVersion });
     licence.feedbackInbox.push(entry);
@@ -1086,9 +1101,6 @@ app.post(['/support/messages', '/api/support/messages'], async (req, res) => {
   }
 });
 
-// GET /support/messages  (alias: /api/support/messages)
-// header: Authorization: Bearer <ADMIN_FEEDBACK_TOKEN>
-// query: status=nouveau|traite|* , q=texte
 app.get(['/support/messages', '/api/support/messages'], async (req, res) => {
   try {
     const auth = req.get('authorization') || '';
@@ -1113,7 +1125,6 @@ app.get(['/support/messages', '/api/support/messages'], async (req, res) => {
         String(r.licence || '').toLowerCase().includes(q)
       );
     }
-
     return res.json({ items: rows, total: rows.length });
   } catch (e) {
     console.error('❌ /support/messages (GET) error:', e);
@@ -1121,9 +1132,6 @@ app.get(['/support/messages', '/api/support/messages'], async (req, res) => {
   }
 });
 
-// POST /support/messages/update (alias: /api/support/messages/update)
-// header: Authorization: Bearer <ADMIN_FEEDBACK_TOKEN>
-// body: { licenceId, id, statut }  // statut: "nouveau" | "traite"
 app.post(['/support/messages/update', '/api/support/messages/update'], async (req, res) => {
   try {
     const auth = req.get('authorization') || '';
@@ -1138,22 +1146,17 @@ app.post(['/support/messages/update', '/api/support/messages/update'], async (re
     if (idx === -1 || !licence) return res.status(404).json({ error: 'LICENCE_INTROUVABLE' });
 
     let changed = false;
-
-    // essaie d'abord la boîte unifiée
     licence.feedbackInbox = Array.isArray(licence.feedbackInbox) ? licence.feedbackInbox : [];
     licence.feedbackInbox = licence.feedbackInbox.map((x) => {
       if (String(x.id) === String(id)) { changed = true; return { ...x, statut }; }
       return x;
     });
-
-    // fallback legacy si pas trouvé
     if (!changed && Array.isArray(licence.feedbacks)) {
       licence.feedbacks = licence.feedbacks.map((x) => {
         if (String(x.id) === String(id)) { changed = true; return { ...x, status: (statut === 'traite' ? 'closed' : 'open') }; }
         return x;
       });
     }
-
     if (!changed) return res.status(404).json({ error: 'MESSAGE_INTROUVABLE' });
 
     const bodyToPut = Array.isArray(rawRecord) ? (list[idx] = licence, list) : licence;
@@ -1166,52 +1169,138 @@ app.post(['/support/messages/update', '/api/support/messages/update'], async (re
   }
 });
 
-// === Compat: /feedback et /api/feedback écrivent aussi dans feedbackInbox ===
+// Compat: /feedback (legacy) → alimente aussi feedbackInbox
 app.post(['/feedback', '/api/feedback'], async (req, res) => {
   try {
-    const { licenceId, subject, message, email, platform, appVersion } = req.body || {};
+    const { licenceId, subject, message, email, platform, opticien } = req.body || {};
     if (!message || String(message).trim().length < 10) {
       return res.status(400).json({ ok: false, error: 'MESSAGE_TOO_SHORT' });
     }
-    if (!licenceId) return res.status(400).json({ ok: false, error: 'LICENCE_ID_REQUIS' });
+    if (!licenceId) {
+      return res.status(400).json({ ok: false, error: 'LICENCE_ID_REQUIS' });
+    }
 
     const { list, rawRecord } = await jsonbinGetAll();
-    const { idx, licence } = findLicenceIndexByAnyId(list, licenceId);
+    const { idx, licence } = findLicenceIndex(list, l => String(l.id) === String(licenceId));
     if (idx === -1) return res.status(404).json({ ok: false, error: 'LICENCE_INTROUVABLE' });
 
-    // écrit dans la boîte unifiée
-    licence.feedbackInbox = Array.isArray(licence.feedbackInbox) ? licence.feedbackInbox : [];
-    const entry = makeInboxEntry(licence, { subject, message, email, platform, appVersion });
-    licence.feedbackInbox.unshift(entry);
-
-    // (optionnel) garde aussi une trace legacy
-    licence.feedbacks = Array.isArray(licence.feedbacks) ? licence.feedbacks : [];
-    licence.feedbacks.unshift({
-      id: entry.id,
-      subject: entry.objet,
-      message: entry.message,
-      email: entry.email,
-      platform: entry.platform,
-      appVersion: entry.appVersion,
+    const fb = {
+      id: uuidv4(),
+      subject: (subject && String(subject).trim()) || 'Suggestion / Contact',
+      message: String(message).trim(),
+      email: (email && String(email).trim()) || '',
+      platform: (platform && String(platform).trim()) || '',
       status: 'open',
-      createdAt: entry.date,
-      updatedAt: entry.date,
+      adminNotes: '',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      opticien: opticien || { enseigne: licence.opticien?.enseigne || '', ville: licence.opticien?.ville || '' }
+    };
+
+    if (!Array.isArray(licence.feedbacks)) licence.feedbacks = [];
+    licence.feedbacks.unshift(fb);
+
+    // met aussi dans la boîte unifiée
+    licence.feedbackInbox = Array.isArray(licence.feedbackInbox) ? licence.feedbackInbox : [];
+    licence.feedbackInbox.unshift({
+      id: fb.id,
+      date: fb.createdAt,
+      licenceId: licence.id,
+      objet: fb.subject,
+      message: fb.message,
+      email: fb.email,
+      platform: fb.platform,
+      appVersion: '',
+      statut: 'nouveau'
     });
 
     const bodyToPut = Array.isArray(rawRecord) ? (list[idx] = licence, list) : licence;
     await jsonbinPutAll(bodyToPut);
 
-    return res.json({ ok: true, id: entry.id });
+    return res.json({ ok: true, id: fb.id });
   } catch (e) {
     console.error('❌ POST /feedback error:', e);
     return res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
   }
 });
 
+app.get('/api/admin/feedback', requireAdminToken, async (req, res) => {
+  try {
+    const { status, q, skip = '0', limit = '50' } = req.query || {};
+    const { list } = await jsonbinGetAll();
 
-// ===================================
+    // aplatit legacy
+    const out = [];
+    for (const lic of list) {
+      const items = Array.isArray(lic.feedbacks) ? lic.feedbacks : [];
+      for (const fb of items) {
+        out.push({ ...fb, licenceId: lic.id, opticien: lic.opticien || {} });
+      }
+    }
+
+    let items = out;
+    if (status) items = items.filter(it => it.status === status);
+    if (q) {
+      const rx = new RegExp(String(q), 'i');
+      items = items.filter(it =>
+        rx.test(it.message) || rx.test(it.subject) || rx.test(it.email) || rx.test(it.licenceId) ||
+        rx.test(it.opticien?.enseigne || '')
+      );
+    }
+
+    items.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    const s = Math.max(0, parseInt(skip));
+    const l = Math.min(200, Math.max(1, parseInt(limit)));
+    const slice = items.slice(s, s + l);
+
+    res.json({ ok: true, total: items.length, items: slice });
+  } catch (e) {
+    console.error('❌ GET /api/admin/feedback error:', e);
+    res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
+  }
+});
+
+app.patch('/api/admin/feedback/:id', requireAdminToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status, adminNotes, handledBy } = req.body || {};
+
+    const { list, rawRecord } = await jsonbinGetAll();
+    let updated = null;
+
+    for (let i = 0; i < list.length; i++) {
+      const licence = list[i];
+      const arr = Array.isArray(licence.feedbacks) ? licence.feedbacks : [];
+      const j = arr.findIndex(f => f.id === id);
+      if (j >= 0) {
+        if (status) arr[j].status = status;
+        if (typeof adminNotes === 'string') arr[j].adminNotes = adminNotes;
+        if (typeof handledBy === 'string') arr[j].handledBy = handledBy;
+        if (status === 'closed') arr[j].handledAt = new Date().toISOString();
+        arr[j].updatedAt = new Date().toISOString();
+        licence.feedbacks = arr;
+        updated = { licenceId: licence.id, item: arr[j] };
+        list[i] = licence;
+        break;
+      }
+    }
+
+    if (!updated) return res.status(404).json({ ok: false, error: 'NOT_FOUND' });
+
+    await jsonbinPutAll(Array.isArray(rawRecord) ? list : list[0] || {});
+    res.json({ ok: true, ...updated });
+  } catch (e) {
+    console.error('❌ PATCH /api/admin/feedback/:id error:', e);
+    res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
+  }
+});
+
+// Petit ping JSON brut
+app.get('/api/ping', (_req, res) => res.json({ ok: true }));
+
+// =======================
 //   Achat de crédits via GoCardless
-// ===================================
+// =======================
 app.post('/achat-credits-gocardless', async (req, res) => {
   const { email, quantity } = req.body;
   const qty = Math.max(1, parseInt(quantity || '1'));
@@ -1225,10 +1314,10 @@ app.post('/achat-credits-gocardless', async (req, res) => {
     const { idx, licence } = findLicenceIndex(list, l =>
       String(l.opticien?.email).toLowerCase() === String(email).toLowerCase()
     );
-    if (idx === -1) return res.status(404).json({ error: "Licence introuvable" });
+    if (idx === -1) return res.status(404).json({ error: 'Licence introuvable' });
 
     const mandate = licence.mandateId;
-    if (!mandate) return res.status(400).json({ error: "Aucun mandat associé à cette licence" });
+    if (!mandate) return res.status(400).json({ error: 'Aucun mandat associé à cette licence' });
 
     const response = await fetch(`${GO_CARDLESS_API_BASE}/payments`, {
       method: 'POST',
@@ -1276,7 +1365,7 @@ app.post('/achat-credits-gocardless', async (req, res) => {
       });
 
       const factureData = await factureResponse.json();
-      console.log("✅ Facture générée :", factureData);
+      console.log('✅ Facture générée :', factureData);
 
       if (factureData?.url) {
         const { list: list2, rawRecord: rec2 } = await jsonbinGetAll();
@@ -1307,7 +1396,7 @@ app.post('/achat-credits-gocardless', async (req, res) => {
 });
 
 // =======================
-//   Stripe: checkout + WH
+//   Stripe: checkout + webhook RAW
 // =======================
 app.post('/create-checkout-session', async (req, res) => {
   const { clientEmail, quantity } = req.body;
@@ -1321,13 +1410,13 @@ app.post('/create-checkout-session', async (req, res) => {
         price_data: {
           currency: 'eur',
           product_data: { name: 'Crédits SMS OptiCOM (lot de 100)' },
-          unit_amount: 1700,
+          unit_amount: 1700
         },
-        quantity: qty,
+        quantity: qty
       }],
       success_url: `opticom://merci-achat?credits=${qty * 100}`,
       cancel_url: 'opticom://annulation-achat',
-      metadata: { email: clientEmail || '', quantity: String(qty) },
+      metadata: { email: clientEmail || '', quantity: String(qty) }
     });
 
     res.json({ url: session.url });
@@ -1337,7 +1426,6 @@ app.post('/create-checkout-session', async (req, res) => {
   }
 });
 
-// ⚠️ Webhook Stripe en RAW UNIQUEMENT
 app.post('/webhook-stripe', express.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
   const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
@@ -1373,7 +1461,7 @@ app.post('/webhook-stripe', express.raw({ type: 'application/json' }), async (re
             const response = await fetch(`http://localhost:${PORT}/api/generate-invoice`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(facturePayload),
+              body: JSON.stringify(facturePayload)
             });
             const data = await response.json();
             invoiceUrl = data.url;
@@ -1471,7 +1559,7 @@ app.get('/api/licence/prefs', async (req, res) => {
       autoLensRenewalEnabled: !!a.autoLensRenewalEnabled,
       lensAdvanceDays: Number.isFinite(+a.lensAdvanceDays) ? +a.lensAdvanceDays : 10,
       messageBirthday: a.messageBirthday || 'Joyeux anniversaire {prenom} !',
-      messageLensRenewal: a.messageLensRenewal || 'Bonjour {prenom}, pensez au renouvellement de vos lentilles.',
+      messageLensRenewal: a.messageLensRenewal || 'Bonjour {prenom}, pensez au renouvellement de vos lentilles.'
     });
   } catch (e) {
     console.error('GET /api/licence/prefs', e);
@@ -1498,7 +1586,7 @@ app.post('/api/licence/prefs', async (req, res) => {
       autoLensRenewalEnabled: !!autoLensRenewalEnabled,
       lensAdvanceDays: lad,
       messageBirthday: cleanStr(messageBirthday, 'Joyeux anniversaire {prenom} !'),
-      messageLensRenewal: cleanStr(messageLensRenewal, 'Bonjour {prenom}, pensez au renouvellement de vos lentilles.'),
+      messageLensRenewal: cleanStr(messageLensRenewal, 'Bonjour {prenom}, pensez au renouvellement de vos lentilles.')
     };
     licence.updatedAt = new Date().toISOString();
 
@@ -1548,9 +1636,9 @@ cron.schedule('0 3 * * *', async () => {
                 headers: {
                   'Content-Type': 'application/json',
                   'Authorization': `Bearer ${process.env.GOCARDLESS_API_KEY}`,
-                  'GoCardless-Version': '2015-07-06',
+                  'GoCardless-Version': '2015-07-06'
                 },
-                body: JSON.stringify({ subscriptions: { amount } }),
+                body: JSON.stringify({ subscriptions: { amount } })
               });
               console.log(`✅ Subscription mise à jour (${amount} centimes) pour ${licence.opticien?.email}`);
             } catch (e) {
@@ -1573,9 +1661,9 @@ cron.schedule('0 3 * * *', async () => {
                 headers: {
                   'Content-Type': 'application/json',
                   'Authorization': `Bearer ${process.env.GOCARDLESS_API_KEY}`,
-                  'GoCardless-Version': '2015-07-06',
+                  'GoCardless-Version': '2015-07-06'
                 },
-                body: JSON.stringify({}),
+                body: JSON.stringify({})
               });
               console.log(`✅ Subscription annulée pour ${licence.opticien?.email}`);
             } else if (licence.mandateId) {
@@ -1584,9 +1672,9 @@ cron.schedule('0 3 * * *', async () => {
                 headers: {
                   'Content-Type': 'application/json',
                   'Authorization': `Bearer ${process.env.GOCARDLESS_API_KEY}`,
-                  'GoCardless-Version': '2015-07-06',
+                  'GoCardless-Version': '2015-07-06'
                 },
-                body: JSON.stringify({}),
+                body: JSON.stringify({})
               });
               console.log(`✅ Mandat annulé pour ${licence.opticien?.email}`);
             }
@@ -1614,7 +1702,7 @@ cron.schedule('0 3 * * *', async () => {
 });
 
 // =======================
-//   Automatisations
+//   Automatisations (anniv / lentilles)
 // =======================
 const PARIS_TZ = 'Europe/Paris';
 function isoTodayParis() {
@@ -1744,7 +1832,7 @@ async function sendSmsAutoForLicence({ licence, list, rawRecord, idx, numero, te
   params.append('emetteur', sender);
 
   const smsResp = await fetch('https://api.smsmode.com/http/1.6/sendSMS.do', {
-    method:'POST', headers:{ 'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8' }, body: params.toString(),
+    method:'POST', headers:{ 'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8' }, body: params.toString()
   });
   const smsText = await smsResp.text();
   const smsHasError = !smsResp.ok || /^32\s*\|/i.test(smsText) || /^35\s*\|/i.test(smsText) || /\berror\b/i.test(smsText);
@@ -1763,8 +1851,8 @@ async function sendSmsAutoForLicence({ licence, list, rawRecord, idx, numero, te
       textHash: sha256Hex(finalText),
       provider: 'smsmode',
       bytes: Buffer.byteLength(finalText, 'utf8'),
-      mois: ymKey(new Date()),
-    },
+      mois: ymKey(new Date())
+    }
   });
 
   return { ok:true };
@@ -1880,130 +1968,8 @@ app.post('/api/generate-invoice', async (req, res) => {
 });
 
 // =======================
-//   FEEDBACK (contact / suggestions)
-//   - POST /feedback (et /api/feedback)
-//   - GET /api/admin/feedback (admin)
-//   - PATCH /api/admin/feedback/:id (admin)
-// =======================
-function flattenFeedbacks(list) {
-  const out = [];
-  for (const lic of list) {
-    const items = Array.isArray(lic.feedbacks) ? lic.feedbacks : [];
-    for (const fb of items) {
-      out.push({ ...fb, licenceId: lic.id, opticien: lic.opticien || {} });
-    }
-  }
-  return out;
-}
-
-app.post(['/feedback', '/api/feedback'], async (req, res) => {
-  try {
-    const { licenceId, subject, message, email, platform, opticien } = req.body || {};
-    if (!message || String(message).trim().length < 10) {
-      return res.status(400).json({ ok: false, error: 'MESSAGE_TOO_SHORT' });
-    }
-    if (!licenceId) {
-      return res.status(400).json({ ok: false, error: 'LICENCE_ID_REQUIS' });
-    }
-
-    const { list, rawRecord } = await jsonbinGetAll();
-    const { idx, licence } = findLicenceIndex(list, l => String(l.id) === String(licenceId));
-    if (idx === -1) return res.status(404).json({ ok: false, error: 'LICENCE_INTROUVABLE' });
-
-    const fb = {
-      id: uuidv4(),
-      subject: (subject && String(subject).trim()) || 'Suggestion / Contact',
-      message: String(message).trim(),
-      email: (email && String(email).trim()) || '',
-      platform: (platform && String(platform).trim()) || '',
-      status: 'open',
-      adminNotes: '',
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      opticien: opticien || { enseigne: licence.opticien?.enseigne || '', ville: licence.opticien?.ville || '' },
-    };
-
-    if (!Array.isArray(licence.feedbacks)) licence.feedbacks = [];
-    licence.feedbacks.unshift(fb); // en tête
-
-    const bodyToPut = Array.isArray(rawRecord) ? (list[idx] = licence, list) : licence;
-    await jsonbinPutAll(bodyToPut);
-
-    return res.json({ ok: true, id: fb.id });
-  } catch (e) {
-    console.error('❌ POST /feedback error:', e);
-    return res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
-  }
-});
-
-app.get('/api/admin/feedback', requireAdminToken, async (req, res) => {
-  try {
-    const { status, q, skip = '0', limit = '50' } = req.query || {};
-    const { list } = await jsonbinGetAll();
-    let items = flattenFeedbacks(list);
-
-    if (status) items = items.filter(it => it.status === status);
-    if (q) {
-      const rx = new RegExp(String(q), 'i');
-      items = items.filter(it =>
-        rx.test(it.message) || rx.test(it.subject) || rx.test(it.email) || rx.test(it.licenceId) ||
-        rx.test(it.opticien?.enseigne || '')
-      );
-    }
-
-    items.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-    const s = Math.max(0, parseInt(skip));
-    const l = Math.min(200, Math.max(1, parseInt(limit)));
-    const slice = items.slice(s, s + l);
-
-    res.json({ ok: true, total: items.length, items: slice });
-  } catch (e) {
-    console.error('❌ GET /api/admin/feedback error:', e);
-    res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
-  }
-});
-
-app.patch('/api/admin/feedback/:id', requireAdminToken, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { status, adminNotes, handledBy } = req.body || {};
-
-    const { list, rawRecord } = await jsonbinGetAll();
-    let updated = null;
-
-    for (let i = 0; i < list.length; i++) {
-      const licence = list[i];
-      const arr = Array.isArray(licence.feedbacks) ? licence.feedbacks : [];
-      const j = arr.findIndex(f => f.id === id);
-      if (j >= 0) {
-        if (status) arr[j].status = status;
-        if (typeof adminNotes === 'string') arr[j].adminNotes = adminNotes;
-        if (typeof handledBy === 'string') arr[j].handledBy = handledBy;
-        if (status === 'closed') arr[j].handledAt = new Date().toISOString();
-        arr[j].updatedAt = new Date().toISOString();
-        licence.feedbacks = arr;
-        updated = { licenceId: licence.id, item: arr[j] };
-        list[i] = licence;
-        break;
-      }
-    }
-
-    if (!updated) return res.status(404).json({ ok: false, error: 'NOT_FOUND' });
-
-    await jsonbinPutAll(Array.isArray(rawRecord) ? list : list[0] || {});
-    res.json({ ok: true, ...updated });
-  } catch (e) {
-    console.error('❌ PATCH /api/admin/feedback/:id error:', e);
-    res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
-  }
-});
-
-// Petit ping JSON brut
-app.get('/api/ping', (_, res) => res.json({ ok: true }));
-
-// =======================
 //   Lancement serveur
 // =======================
 app.listen(PORT, () => {
-  console.log(`✅ Serveur prêt sur http://localhost:${PORT}`);
+  console.log(`[OptiCOM] Server up on :${PORT} (Node ${process.version})`);
 });
