@@ -40,6 +40,21 @@ try {
 const fetch = globalThis.fetch.bind(globalThis);
 
 const app = express();
+// --- Metrics ultra-simples
+const metrics = { byPath: new Map(), jsonbinGets: 0, jsonbinPuts: 0, cacheHits: 0, cacheMiss: 0 };
+app.use((req, _res, next) => {
+  const key = `${req.method} ${req.path}`;
+  metrics.byPath.set(key, (metrics.byPath.get(key) || 0) + 1);
+  next();
+});
+app.get('/__metrics', (_req, res) => {
+  res.json({
+    jsonbin: { gets: metrics.jsonbinGets, puts: metrics.jsonbinPuts, cacheHits: metrics.cacheHits, cacheMiss: metrics.cacheMiss },
+    byPath: Object.fromEntries(metrics.byPath),
+    now: new Date().toISOString()
+  });
+});
+
 app.set('trust proxy', 1); // important derrière Render/NGINX
 const PORT = process.env.PORT || 3001;
 
@@ -165,22 +180,65 @@ app.post('/api/upload-facture', requireAdminToken, upload.single('pdf'), (req, r
 // =======================
 //   JSONBIN HELPERS (BIN licences)
 // =======================
+// ==== Metrics & Cache JSONBin (drop-in) ====
+// Compteurs globaux (réutilisés si déjà présents)
+const __METRICS__ = (global.__METRICS__ = global.__METRICS__ || {
+  jsonbinGets: 0,
+  jsonbinPuts: 0,
+  cacheHits: 0,
+  cacheMiss: 0,
+});
+
+// TTL du cache (ms) – ajuste via env si besoin
+const JSONBIN_CACHE_TTL_MS = Number(process.env.JSONBIN_CACHE_TTL_MS || 15000);
+
+// Cache en mémoire + dédoublonnage des GET en vol
+let __jsonbinCache = { data: null, expires: 0 };
+let __jsonbinInflight = null;
+
 const must = (v, name) => { if (!v) throw new Error(`${name} manquant.`); return v; };
 
-async function jsonbinGetAll() {
+async function jsonbinGetAll(force = false) {
   const binId = must(JSONBIN_BIN_ID, 'JSONBIN_BIN_ID');
+  const now = Date.now();
+
+  // Cache hit ?
+  if (!force && __jsonbinCache.data && now < __jsonbinCache.expires) {
+    __METRICS__.cacheHits++;
+    return __jsonbinCache.data;
+  }
+
+  __METRICS__.cacheMiss++;
+
+  // Requêtes concurrentes : on partage la même promesse
+  if (__jsonbinInflight) {
+    try { return await __jsonbinInflight; } finally {}
+  }
+
   const headers = { 'X-Bin-Meta': 'false' };
   if (JSONBIN_KEY) headers['X-Master-Key'] = JSONBIN_KEY;
 
-  const r = await fetch(`https://api.jsonbin.io/v3/b/${binId}/latest`, { headers });
-  if (!r.ok) {
-    const t = await r.text().catch(() => '');
-    throw new Error(`Erreur JSONBin (${r.status}): ${t}`);
+  __jsonbinInflight = (async () => {
+    __METRICS__.jsonbinGets++;
+    const r = await fetch(`https://api.jsonbin.io/v3/b/${binId}/latest`, { headers });
+    if (!r.ok) {
+      const t = await r.text().catch(() => '');
+      throw new Error(`Erreur JSONBin (${r.status}): ${t}`);
+    }
+    const data = await r.json();
+    const record = data?.record ?? data;
+    const list = Array.isArray(record) ? record : [record];
+
+    const payload = { list, rawRecord: record };
+    __jsonbinCache = { data: payload, expires: now + JSONBIN_CACHE_TTL_MS };
+    return payload;
+  })();
+
+  try {
+    return await __jsonbinInflight;
+  } finally {
+    __jsonbinInflight = null;
   }
-  const data = await r.json();
-  const record = data?.record ?? data;
-  const list = Array.isArray(record) ? record : [record];
-  return { list, rawRecord: record };
 }
 
 async function jsonbinPutAll(body) {
@@ -188,6 +246,7 @@ async function jsonbinPutAll(body) {
   const headers = { 'Content-Type': 'application/json', 'X-Bin-Versioning': 'false' };
   if (JSONBIN_KEY) headers['X-Master-Key'] = JSONBIN_KEY;
 
+  __METRICS__.jsonbinPuts++;
   const r = await fetch(`https://api.jsonbin.io/v3/b/${binId}`, {
     method: 'PUT',
     headers,
@@ -197,6 +256,14 @@ async function jsonbinPutAll(body) {
     const t = await r.text().catch(() => '');
     throw new Error(`Erreur mise à jour JSONBin: ${t}`);
   }
+
+  // ✅ On met à jour le cache local immédiatement après un PUT réussi
+  const rawRecord = body;
+  const list = Array.isArray(body) ? body : [body];
+  __jsonbinCache = {
+    data: { list, rawRecord },
+    expires: Date.now() + JSONBIN_CACHE_TTL_MS,
+  };
 }
 
 function findLicenceIndex(list, predicate) {
@@ -213,6 +280,10 @@ function findLicenceIndexByAnyId(list, licenceId) {
       String(l.opticien?.id || '').trim() === K
   );
 }
+
+// (facultatif) expose les métriques si tu veux les lire depuis une route /__metrics
+module.exports.__JSONBIN_METRICS__ = __METRICS__;
+
 
 // =======================
 //   Licence update helper
