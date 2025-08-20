@@ -910,6 +910,58 @@ async function appendSmsLogAndPersist({ list, rawRecord, idx, licence, entry }) 
   await jsonbinPutAll(bodyToPut);
 }
 
+// =======================
+//   Historique SMS : purge
+// =======================
+app.post(['/api/sms-history/erase', '/licence/history/erase'], async (req, res) => {
+  try {
+    const { licenceId, all, numero, phoneNumber } = req.body || {};
+    if (!licenceId) return res.status(400).json({ ok:false, error:'licenceId requis' });
+
+    const num = toFRNumber(numero || phoneNumber || '');
+    const { list, rawRecord } = await jsonbinGetAll();
+    const { idx, licence } = findLicenceIndex(list, l => String(l.id) === String(licenceId));
+    if (idx === -1) return res.status(404).json({ ok:false, error:'LICENCE_INTROUVABLE' });
+
+    const before = Array.isArray(licence.historiqueSms) ? licence.historiqueSms : [];
+    let after;
+
+    if (all === true) {
+      after = [];
+    } else if (num) {
+      const n = normalizeFR(num);
+      after = before.filter(h => normalizeFR(h.numero || '') !== n);
+    } else {
+      return res.status(400).json({ ok:false, error:'Précisez all:true ou numero' });
+    }
+
+    const removed = before.length - after.length;
+    licence.historiqueSms = after;
+    licence.updatedAt = new Date().toISOString();
+
+    const bodyToPut = Array.isArray(rawRecord) ? (list[idx] = licence, list) : licence;
+    await jsonbinPutAll(bodyToPut);
+
+    return res.json({ ok:true, removed });
+  } catch (e) {
+    console.error('❌ purge historique:', e);
+    return res.status(500).json({ ok:false, error:'SERVER_ERROR' });
+  }
+});
+
+// Variante "un numéro" conviviale
+app.post(
+  ['/api/sms-history/erase-for-number', '/licence/history/erase-for-number'],
+  async (req, res) => {
+    req.body = { ...req.body, all: false }; // force le mode numéro
+    // On réutilise la route précédente pour éviter le code dupliqué
+    return app._router.handle(
+      Object.assign(req, { url: '/api/sms-history/erase', method: 'POST' }),
+      res,
+      () => {}
+    );
+  }
+);
 
 
 // --- Opt-out
