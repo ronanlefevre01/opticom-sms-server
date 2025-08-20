@@ -302,6 +302,32 @@ function findLicenceIndexByAnyId(list, licenceId) {
   );
 }
 
+// --- Serialize JSONBin writes & always merge on latest snapshot ---
+let __jsonbinWriteChain = Promise.resolve();
+
+/**
+ * Exécute mutator sur l'état *le plus récent* (force=true), sérialise les écritures,
+ * et fait un PUT unique. Le mutator DOIT muter `list` in-place.
+ * La valeur retournée par le mutator est renvoyée à l'appelant.
+ * Pour annuler la sauvegarde, retourne { __skipSave: true }.
+ */
+async function withJsonbinUpdate(mutator) {
+  let out;
+  __jsonbinWriteChain = __jsonbinWriteChain.then(async () => {
+    const state = await jsonbinGetAll(true); // ⬅️ bypass cache pour éviter l'ancien état
+    out = (await mutator(state)) || {};
+    if (out.__skipSave) return;
+    const toPut = Array.isArray(state.rawRecord) ? state.list : (Array.isArray(state.list) ? state.list[0] || {} : state.list);
+    await jsonbinPutAll(toPut);
+  }).catch((e) => {
+    console.error('withJsonbinUpdate failed:', e);
+    throw e;
+  });
+  await __jsonbinWriteChain;
+  return out;
+}
+
+
 // (facultatif) expose les métriques si tu veux les lire depuis une route /__metrics
 module.exports.__JSONBIN_METRICS__ = __METRICS__;
 
@@ -309,24 +335,20 @@ module.exports.__JSONBIN_METRICS__ = __METRICS__;
 //   Licence update helper
 // =======================
 async function updateLicenceFields({ licenceId, opticienId, patch = {} }) {
-  const { list, rawRecord } = await jsonbinGetAll();
-
-  const { idx, licence } = findLicenceIndex(
-    list,
-    (l) =>
-      (licenceId && String(l.id) === String(licenceId)) ||
-      (opticienId && String(l.opticien?.id) === String(opticienId))
-  );
-  if (idx === -1 || !licence) {
-    return { ok: false, status: 404, error: 'LICENCE_NOT_FOUND' };
-  }
-
-  const updated = { ...licence, ...patch, updatedAt: new Date().toISOString() };
-  const bodyToPut = Array.isArray(rawRecord) ? (list[idx] = updated, list) : updated;
-  await jsonbinPutAll(bodyToPut);
-
-  return { ok: true, licence: updated };
+  const res = await withJsonbinUpdate(({ list }) => {
+    const { idx, licence } = findLicenceIndex(
+      list,
+      (l) =>
+        (licenceId && String(l.id) === String(licenceId)) ||
+        (opticienId && String(l.opticien?.id) === String(opticienId))
+    );
+    if (idx === -1 || !licence) return { ok: false, status: 404, error: 'LICENCE_NOT_FOUND', __skipSave: true };
+    list[idx] = { ...licence, ...patch, updatedAt: new Date().toISOString() };
+    return { ok: true, licence: list[idx] };
+  });
+  return res;
 }
+
 
 // =======================
 //   Licence: expéditeur
@@ -339,22 +361,27 @@ app.post('/licence/expediteur', async (req, res) => {
     const cleaned = String(libelleExpediteur).replace(/[^a-zA-Z0-9]/g, '').slice(0, 11);
     if (cleaned.length < 3) return res.status(400).json({ success: false, error: 'LIBELLE_INVALIDE' });
 
-    const { list, rawRecord } = await jsonbinGetAll();
-    let found = { idx: -1, licence: null };
-    if (licenceId) found = findLicenceIndex(list, l => String(l.id) === String(licenceId));
-    else if (opticienId) found = findLicenceIndex(list, l => String(l.opticien?.id) === String(opticienId));
-    if (found.idx === -1) return res.status(404).json({ success: false, error: 'LICENCE_INTROUVABLE' });
+    const result = await withJsonbinUpdate(({ list }) => {
+      const { idx, licence } = findLicenceIndex(
+        list,
+        (l) =>
+          (licenceId && String(l.id) === String(licenceId)) ||
+          (opticienId && String(l.opticien?.id) === String(opticienId))
+      );
+      if (idx === -1 || !licence) return { __skipSave: true, status: 404 };
+      list[idx].libelleExpediteur = cleaned;
+      list[idx].updatedAt = new Date().toISOString();
+      return { licence: list[idx] };
+    });
 
-    list[found.idx].libelleExpediteur = cleaned;
-    const bodyToPut = Array.isArray(rawRecord) ? list : list[found.idx];
-    await jsonbinPutAll(bodyToPut);
-
-    res.json({ success: true, licence: list[found.idx] });
+    if (result?.status === 404) return res.status(404).json({ success: false, error: 'LICENCE_INTROUVABLE' });
+    res.json({ success: true, licence: result.licence });
   } catch (e) {
     console.error('❌ /licence/expediteur error:', e);
     res.status(500).json({ success: false, error: 'SERVER_ERROR' });
   }
 });
+
 
 // =======================
 //   Licence: signature SMS
@@ -765,6 +792,11 @@ const crypto = require('crypto');
 const lastSent = new Map();
 const MIN_INTERVAL_MS = 15 * 1000;
 
+function sanitizeCategorie(raw) {
+  const s = String(raw || '').trim();
+  return s ? s.slice(0, 32) : 'autre'; // max 32 chars, défaut "autre"
+}
+
 function ymKey(d = new Date()) { return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`; }
 function sha256Hex(s) { return crypto.createHash('sha256').update(String(s)).digest('hex'); }
 function normalizeFR(msisdn='') { return toFRNumber(msisdn).replace(/\D/g,''); }
@@ -801,12 +833,18 @@ async function markOptOut(licenceId, phoneE164) {
   await jsonbinPutAll(Array.isArray(rawRecord) ? list : list[idx]);
   return true;
 }
-async function appendSmsLogAndPersist({ list, rawRecord, idx, licence, entry }) {
-  licence.historiqueSms = Array.isArray(licence.historiqueSms) ? licence.historiqueSms : [];
-  licence.historiqueSms.push(entry);
-  const bodyToPut = Array.isArray(rawRecord) ? (list[idx] = licence, list) : licence;
-  await jsonbinPutAll(bodyToPut);
+async function appendSmsLogAndPersist({ licenceId, entry }) {
+  await withJsonbinUpdate(({ list }) => {
+    const { idx, licence } = findLicenceIndex(list, l => String(l.id) === String(licenceId));
+    if (idx === -1) return { __skipSave: true };
+    const lic = list[idx];
+    lic.historiqueSms = Array.isArray(lic.historiqueSms) ? lic.historiqueSms : [];
+    lic.historiqueSms.push(entry);
+    lic.updatedAt = new Date().toISOString();
+    return { licence: lic };
+  });
 }
+
 
 // --- Opt-out
 app.get('/unsubscribe', async (req, res) => {
@@ -923,8 +961,22 @@ app.post('/consent', async (req, res) => {
 // ============================
 //   Envoi SMS (transactionnel / promo)
 // ============================
+// --- Catégorie libre pour l'historique ----------------------------
+function sanitizeCategorie(raw) {
+  const s = String(raw || '').trim();
+  return s ? s.slice(0, 32) : 'autre'; // ex: "lunettes", "lentilles", "sav", "noel", "été"
+}
+
+// (si tu n'as pas déjà ce helper global ailleurs)
+function ensureStopMention(text) {
+  return /stop\s+au\s+36111/i.test(text) ? text : `${text}\nSTOP au 36111`;
+}
+
+// ============================
+//   Envoi SMS (avec catégorie)
+// ============================
 async function sendSmsTransactional(req, res) {
-  const { phoneNumber, message, licenceId, opticienId } = req.body || {};
+  const { phoneNumber, message, licenceId, opticienId, categorie } = req.body || {};
   if (!phoneNumber || !message || (!licenceId && !opticienId)) {
     return res.status(400).json({ success: false, error: 'Champs manquants.' });
   }
@@ -940,6 +992,7 @@ async function sendSmsTransactional(req, res) {
     if (found.idx === -1) return res.status(403).json({ success:false, error:'Licence introuvable.' });
     const licence = found.licence;
 
+    // Crédit requis si pas "Illimitée"
     if (licence.abonnement !== 'Illimitée') {
       const credits = Number(licence.credits || 0);
       if (!Number.isFinite(credits) || credits < 1) {
@@ -949,6 +1002,7 @@ async function sendSmsTransactional(req, res) {
 
     const numero = toFRNumber(phoneNumber);
 
+    // Rate-limit par licence + numéro normalisé
     const rlKey = `${licence.id}:${normalizeFR(numero)}`;
     const last = lastSent.get(rlKey) || 0;
     if (Date.now() - last < MIN_INTERVAL_MS) {
@@ -956,9 +1010,11 @@ async function sendSmsTransactional(req, res) {
     }
     lastSent.set(rlKey, Date.now());
 
-    const { sender, signature } = req.smsContext;
+    // Sender/signature fournis par le middleware applySenderAndSignature
+    const { sender, signature } = req.smsContext || {};
     const finalMessage = buildFinalMessage(message, signature);
 
+    // Envoi SMSMode
     const params = new URLSearchParams();
     params.append('pseudo', process.env.SMSMODE_LOGIN);
     params.append('pass', process.env.SMSMODE_PASSWORD);
@@ -982,14 +1038,17 @@ async function sendSmsTransactional(req, res) {
       return res.status(502).json({ success:false, error:`Erreur SMSMode: ${smsText}` });
     }
 
+    // Décrément crédit après succès
     if (licence.abonnement !== 'Illimitée') {
       licence.credits = Math.max(0, Number(licence.credits || 0) - 1);
     }
+
+    // Log avec catégorie libre
     await appendSmsLogAndPersist({
       list, rawRecord, idx: found.idx, licence,
       entry: {
         date: new Date().toISOString(),
-        type: 'transactional',
+        type: sanitizeCategorie(categorie), // <= "lunettes", "lentilles", "sav", "noel", ...
         numero,
         emetteur: sender,
         textHash: sha256Hex(finalMessage),
@@ -1005,7 +1064,8 @@ async function sendSmsTransactional(req, res) {
       credits: licence.credits,
       abonnement: licence.abonnement,
       sender,
-      message: finalMessage
+      message: finalMessage,
+      categorie: sanitizeCategorie(categorie)
     });
   } catch (err) {
     console.error('Erreur /send-sms:', err);
@@ -1017,7 +1077,7 @@ app.post('/send-sms', applySenderAndSignature, sendSmsTransactional);
 app.post('/send-transactional', applySenderAndSignature, sendSmsTransactional);
 
 app.post('/send-promotional', applySenderAndSignature, async (req, res) => {
-  const { phoneNumber, message, licenceId, opticienId, marketingConsent } = req.body || {};
+  const { phoneNumber, message, licenceId, opticienId, marketingConsent, categorie } = req.body || {};
 
   if (!phoneNumber || (!licenceId && !opticienId)) {
     return res.status(400).json({ success: false, error: 'Champs manquants.' });
@@ -1039,6 +1099,7 @@ app.post('/send-promotional', applySenderAndSignature, async (req, res) => {
 
     const numero = toFRNumber(phoneNumber);
 
+    // Consentement marketing requis
     const hasConsent =
       marketingConsent === true ||
       (Array.isArray(licence.consents) && licence.consents.includes(numero)) ||
@@ -1048,23 +1109,24 @@ app.post('/send-promotional', applySenderAndSignature, async (req, res) => {
       return res.status(403).json({ success: false, error: 'CONSENTEMENT_MARKETING_ABSENT' });
     }
 
+    // Opt-out vérifié
     if (isOptedOut(licence, numero)) {
       return res.status(403).json({ success: false, error: 'DESTINATAIRE_DESINSCRIT' });
     }
 
-    const rlKey = `${licence.id}:${numero}`;
+    // Rate-limit par licence + numéro normalisé
+    const rlKey = `${licence.id}:${normalizeFR(numero)}`;
     const last = lastSent.get(rlKey) || 0;
     if (Date.now() - last < MIN_INTERVAL_MS) {
-      return res
-        .status(429)
-        .json({ success: false, error: 'Trop rapproché, réessayez dans quelques secondes.' });
+      return res.status(429).json({ success: false, error: 'Trop rapproché, réessayez dans quelques secondes.' });
     }
     lastSent.set(rlKey, Date.now());
 
-    const { sender, signature } = req.smsContext;
+    const { sender, signature } = req.smsContext || {};
     const baseText = buildFinalMessage(message || '', signature || '');
-    const finalMessage = ensureStopMention(baseText);
+    const finalMessage = ensureStopMention(baseText); // STOP au 36111
 
+    // Envoi SMSMode
     const params = new URLSearchParams();
     params.append('pseudo', process.env.SMSMODE_LOGIN);
     params.append('pass', process.env.SMSMODE_PASSWORD);
@@ -1088,10 +1150,12 @@ app.post('/send-promotional', applySenderAndSignature, async (req, res) => {
       return res.status(502).json({ success: false, error: `Erreur SMSMode: ${smsText}` });
     }
 
+    // Décrément crédit après succès (si pas illimitée)
     if (licence.abonnement !== 'Illimitée') {
       licence.credits = Math.max(0, Number(licence.credits || 0) - 1);
     }
 
+    // Log avec catégorie libre
     await appendSmsLogAndPersist({
       list,
       rawRecord,
@@ -1099,7 +1163,7 @@ app.post('/send-promotional', applySenderAndSignature, async (req, res) => {
       licence,
       entry: {
         date: new Date().toISOString(),
-        type: 'marketing',
+        type: sanitizeCategorie(categorie), // <= "noel", "été", "lunettes", ...
         numero,
         emetteur: sender,
         textHash: sha256Hex(finalMessage),
@@ -1114,13 +1178,15 @@ app.post('/send-promotional', applySenderAndSignature, async (req, res) => {
       licenceId: licence.id,
       sender,
       message: finalMessage,
-      credits: licence.credits
+      credits: licence.credits,
+      categorie: sanitizeCategorie(categorie)
     });
   } catch (err) {
     console.error('Erreur /send-promotional:', err);
     res.status(500).json({ success: false, error: String(err.message || err) });
   }
 });
+
 
 // =======================
 //   SUPPORT / FEEDBACK
@@ -1784,36 +1850,40 @@ app.post('/api/clients/upsert', async (req, res) => {
     const { licenceId, clients } = req.body || {};
     if (!licenceId || !Array.isArray(clients)) return res.status(400).json({ error: 'PARAMS' });
 
-    const { list, rawRecord } = await jsonbinGetAll();
-    const { idx, licence } = findLicenceIndex(list, l => String(l.id) === String(licenceId) || String(l.licence) === String(licenceId));
-    if (idx === -1) return res.status(404).json({ error: 'LICENCE_INTROUVABLE' });
+    const result = await withJsonbinUpdate(({ list }) => {
+      const { idx, licence } = findLicenceIndex(list, l =>
+        String(l.id) === String(licenceId) || String(l.licence) === String(licenceId)
+      );
+      if (idx === -1 || !licence) return { __skipSave: true, status: 404 };
 
-    const exists = new Map();
-    const current = Array.isArray(licence.clients) ? licence.clients : [];
-    for (const c of current) exists.set(String(c.id), c);
+      const exists = new Map();
+      const current = Array.isArray(licence.clients) ? licence.clients : [];
+      for (const c of current) exists.set(String(c.id), c);
 
-    let changed = 0;
-    for (const raw of clients.slice(0, 5000)) {
-      const nc = cleanClient(raw);
-      const prev = exists.get(String(nc.id));
-      if (!prev || new Date(nc.updatedAt) > new Date(prev.updatedAt)) {
-        exists.set(String(nc.id), { ...(prev || {}), ...nc });
-        changed++;
+      let changed = 0;
+      for (const raw of clients.slice(0, 5000)) {
+        const nc = cleanClient(raw);
+        const prev = exists.get(String(nc.id));
+        if (!prev || new Date(nc.updatedAt) > new Date(prev.updatedAt)) {
+          exists.set(String(nc.id), { ...(prev || {}), ...nc });
+          changed++;
+        }
       }
-    }
 
-    const merged = Array.from(exists.values()).slice(-50000);
-    licence.clients = merged;
-    licence.updatedAt = new Date().toISOString();
+      const merged = Array.from(exists.values()).slice(-50000);
+      list[idx].clients = merged;                     // ✅ on ne touche qu’aux clients
+      list[idx].updatedAt = new Date().toISOString(); // (signature/libellé/historique conservés)
+      return { changed, total: merged.length };
+    });
 
-    const bodyToPut = Array.isArray(rawRecord) ? (list[idx] = licence, list) : licence;
-    await jsonbinPutAll(bodyToPut);
-    res.json({ ok: true, changed, total: merged.length });
+    if (result?.status === 404) return res.status(404).json({ error: 'LICENCE_INTROUVABLE' });
+    res.json({ ok: true, changed: result.changed, total: result.total });
   } catch (e) {
     console.error('POST /api/clients/upsert', e);
     res.status(500).json({ error: 'SERVER_ERROR' });
   }
 });
+
 
 app.delete('/api/clients/:id', async (req, res) => {
   try {
@@ -1821,27 +1891,31 @@ app.delete('/api/clients/:id', async (req, res) => {
     const { id } = req.params || {};
     if (!licenceId || !id) return res.status(400).json({ error: 'PARAMS' });
 
-    const { list, rawRecord } = await jsonbinGetAll();
-    const { idx, licence } = findLicenceIndex(list, l => String(l.id) === String(licenceId) || String(l.licence) === String(licenceId));
-    if (idx === -1) return res.status(404).json({ error: 'LICENCE_INTROUVABLE' });
+    const result = await withJsonbinUpdate(({ list }) => {
+      const { idx, licence } = findLicenceIndex(list, l =>
+        String(l.id) === String(licenceId) || String(l.licence) === String(licenceId)
+      );
+      if (idx === -1 || !licence) return { __skipSave: true, status: 404 };
+      const arr = Array.isArray(licence.clients) ? licence.clients : [];
+      const j = arr.findIndex(c => String(c.id) === String(id));
+      if (j === -1) return { __skipSave: true, status: 404, code: 'CLIENT_INTROUVABLE' };
+      arr[j].deletedAt = new Date().toISOString();
+      arr[j].updatedAt = arr[j].deletedAt;
+      list[idx].clients = arr;
+      return {};
+    });
 
-    const arr = Array.isArray(licence.clients) ? licence.clients : [];
-    const j = arr.findIndex(c => String(c.id) === String(id));
-    if (j === -1) return res.status(404).json({ error: 'CLIENT_INTROUVABLE' });
-
-    arr[j].deletedAt = new Date().toISOString();
-    arr[j].updatedAt = arr[j].deletedAt;
-    licence.clients = arr;
-
-    const bodyToPut = Array.isArray(rawRecord) ? (list[idx] = licence, list) : licence;
-    await jsonbinPutAll(bodyToPut);
-
+    if (result?.status === 404) {
+      if (result.code === 'CLIENT_INTROUVABLE') return res.status(404).json({ error: 'CLIENT_INTROUVABLE' });
+      return res.status(404).json({ error: 'LICENCE_INTROUVABLE' });
+    }
     res.json({ ok: true });
   } catch (e) {
     console.error('DELETE /api/clients/:id', e);
     res.status(500).json({ error: 'SERVER_ERROR' });
   }
 });
+
 
 
 // =======================
