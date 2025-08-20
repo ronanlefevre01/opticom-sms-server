@@ -1604,6 +1604,150 @@ app.post('/api/licence/prefs', async (req, res) => {
   }
 });
 
+// ===== Templates (messages sauvegardés par licence) =====
+app.get('/api/templates', async (req, res) => {
+  try {
+    const { licenceId } = req.query || {};
+    if (!licenceId) return res.status(400).json({ error: 'licenceId requis' });
+
+    const { list } = await jsonbinGetAll();
+    const { idx, licence } = findLicenceIndex(list, l => String(l.id) === String(licenceId) || String(l.licence) === String(licenceId));
+    if (idx === -1) return res.status(404).json({ error: 'LICENCE_INTROUVABLE' });
+
+    res.json({ items: Array.isArray(licence.templates) ? licence.templates : [] });
+  } catch (e) {
+    console.error('GET /api/templates', e);
+    res.status(500).json({ error: 'SERVER_ERROR' });
+  }
+});
+
+app.post('/api/templates/save', async (req, res) => {
+  try {
+    const { licenceId, items } = req.body || {};
+    if (!licenceId || !Array.isArray(items)) return res.status(400).json({ error: 'PARAMS' });
+
+    const { list, rawRecord } = await jsonbinGetAll();
+    const { idx, licence } = findLicenceIndex(list, l => String(l.id) === String(licenceId) || String(l.licence) === String(licenceId));
+    if (idx === -1) return res.status(404).json({ error: 'LICENCE_INTROUVABLE' });
+
+    const sanitized = items.slice(0, 200).map(t => ({
+      id: t.id || uuidv4(),
+      label: String(t.label || '').slice(0, 100),
+      text: String(t.text || '').slice(0, 1000)
+    }));
+
+    licence.templates = sanitized;
+    licence.updatedAt = new Date().toISOString();
+
+    const bodyToPut = Array.isArray(rawRecord) ? (list[idx] = licence, list) : licence;
+    await jsonbinPutAll(bodyToPut);
+    res.json({ ok: true, items: sanitized });
+  } catch (e) {
+    console.error('POST /api/templates/save', e);
+    res.status(500).json({ error: 'SERVER_ERROR' });
+  }
+});
+
+// ===== Clients (synchronisation multi-postes) =====
+function cleanClient(c) {
+  return {
+    id: c.id || uuidv4(),
+    prenom: String(c.prenom || c.firstName || '').slice(0, 80),
+    nom: String(c.nom || c.lastName || '').slice(0, 80),
+    phone: toFRNumber(c.phone || c.telephone || c.mobile || ''),
+    email: String(c.email || '').slice(0, 160),
+    naissance: c.naissance || c.birthdate || null,
+    lensStartDate: c.lensStartDate || null,
+    lensEndDate: c.lensEndDate || null,
+    lensDuration: c.lensDuration || null,
+    note: String(c.note || '').slice(0, 500),
+    updatedAt: c.updatedAt || new Date().toISOString(),
+    deletedAt: c.deletedAt || null
+  };
+}
+
+app.get('/api/clients', async (req, res) => {
+  try {
+    const { licenceId } = req.query || {};
+    if (!licenceId) return res.status(400).json({ error: 'licenceId requis' });
+
+    const { list } = await jsonbinGetAll();
+    const { idx, licence } = findLicenceIndex(list, l => String(l.id) === String(licenceId) || String(l.licence) === String(licenceId));
+    if (idx === -1) return res.status(404).json({ error: 'LICENCE_INTROUVABLE' });
+
+    const clients = Array.isArray(licence.clients) ? licence.clients : [];
+    res.json({ items: clients.filter(c => !c.deletedAt) });
+  } catch (e) {
+    console.error('GET /api/clients', e);
+    res.status(500).json({ error: 'SERVER_ERROR' });
+  }
+});
+
+app.post('/api/clients/upsert', async (req, res) => {
+  try {
+    const { licenceId, clients } = req.body || {};
+    if (!licenceId || !Array.isArray(clients)) return res.status(400).json({ error: 'PARAMS' });
+
+    const { list, rawRecord } = await jsonbinGetAll();
+    const { idx, licence } = findLicenceIndex(list, l => String(l.id) === String(licenceId) || String(l.licence) === String(licenceId));
+    if (idx === -1) return res.status(404).json({ error: 'LICENCE_INTROUVABLE' });
+
+    const exists = new Map();
+    const current = Array.isArray(licence.clients) ? licence.clients : [];
+    for (const c of current) exists.set(String(c.id), c);
+
+    let changed = 0;
+    for (const raw of clients.slice(0, 5000)) {
+      const nc = cleanClient(raw);
+      const prev = exists.get(String(nc.id));
+      if (!prev || new Date(nc.updatedAt) > new Date(prev.updatedAt)) {
+        exists.set(String(nc.id), { ...(prev || {}), ...nc });
+        changed++;
+      }
+    }
+
+    const merged = Array.from(exists.values()).slice(-50000);
+    licence.clients = merged;
+    licence.updatedAt = new Date().toISOString();
+
+    const bodyToPut = Array.isArray(rawRecord) ? (list[idx] = licence, list) : licence;
+    await jsonbinPutAll(bodyToPut);
+    res.json({ ok: true, changed, total: merged.length });
+  } catch (e) {
+    console.error('POST /api/clients/upsert', e);
+    res.status(500).json({ error: 'SERVER_ERROR' });
+  }
+});
+
+app.delete('/api/clients/:id', async (req, res) => {
+  try {
+    const { licenceId } = req.query || {};
+    const { id } = req.params || {};
+    if (!licenceId || !id) return res.status(400).json({ error: 'PARAMS' });
+
+    const { list, rawRecord } = await jsonbinGetAll();
+    const { idx, licence } = findLicenceIndex(list, l => String(l.id) === String(licenceId) || String(l.licence) === String(licenceId));
+    if (idx === -1) return res.status(404).json({ error: 'LICENCE_INTROUVABLE' });
+
+    const arr = Array.isArray(licence.clients) ? licence.clients : [];
+    const j = arr.findIndex(c => String(c.id) === String(id));
+    if (j === -1) return res.status(404).json({ error: 'CLIENT_INTROUVABLE' });
+
+    arr[j].deletedAt = new Date().toISOString();
+    arr[j].updatedAt = arr[j].deletedAt;
+    licence.clients = arr;
+
+    const bodyToPut = Array.isArray(rawRecord) ? (list[idx] = licence, list) : licence;
+    await jsonbinPutAll(bodyToPut);
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('DELETE /api/clients/:id', e);
+    res.status(500).json({ error: 'SERVER_ERROR' });
+  }
+});
+
+
 // =======================
 //   CRON formules / résiliation
 // =======================
