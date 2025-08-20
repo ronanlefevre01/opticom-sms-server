@@ -40,20 +40,43 @@ try {
 const fetch = globalThis.fetch.bind(globalThis);
 
 const app = express();
+
 // --- Metrics ultra-simples
-const metrics = { byPath: new Map(), jsonbinGets: 0, jsonbinPuts: 0, cacheHits: 0, cacheMiss: 0 };
+const metrics = { byPath: new Map() };
 app.use((req, _res, next) => {
   const key = `${req.method} ${req.path}`;
   metrics.byPath.set(key, (metrics.byPath.get(key) || 0) + 1);
   next();
 });
 app.get('/__metrics', (_req, res) => {
+  const jm = global.__METRICS__ || { jsonbinGets: 0, jsonbinPuts: 0, cacheHits: 0, cacheMiss: 0 };
   res.json({
-    jsonbin: { gets: metrics.jsonbinGets, puts: metrics.jsonbinPuts, cacheHits: metrics.cacheHits, cacheMiss: metrics.cacheMiss },
+    jsonbin: { gets: jm.jsonbinGets, puts: jm.jsonbinPuts, cacheHits: jm.cacheHits, cacheMiss: jm.cacheMiss },
     byPath: Object.fromEntries(metrics.byPath),
     now: new Date().toISOString()
   });
 });
+
+// --- Petit burst limiter défensif
+function makeBurstLimiter({ limit = 6, windowMs = 10_000 } = {}) {
+  const buckets = new Map();
+  return (req, res, next) => {
+    if (req.method === 'OPTIONS') return next();
+    const key = `${req.path}|${req.ip}`;
+    const now = Date.now();
+    const arr = buckets.get(key) || [];
+    while (arr.length && now - arr[0] > windowMs) arr.shift();
+    if (arr.length >= limit) {
+      const retry = Math.ceil((windowMs - (now - arr[0])) / 1000);
+      res.set('Retry-After', String(retry));
+      return res.status(429).json({ error: 'RATE_LIMITED', retryAfterSec: retry });
+    }
+    arr.push(now);
+    buckets.set(key, arr);
+    next();
+  };
+}
+const burstLimiter = makeBurstLimiter({ limit: 6, windowMs: 10_000 });
 
 app.set('trust proxy', 1); // important derrière Render/NGINX
 const PORT = process.env.PORT || 3001;
@@ -111,16 +134,14 @@ const corsOptions = {
 };
 app.use((req, res, next) => { res.setHeader('Vary', 'Origin'); next(); });
 app.use(cors(corsOptions));
-
-// option B (recommandée, RegExp) :
-app.options(/.*/, cors(corsOptions));
+app.options(/.*/, cors(corsOptions)); // preflight
 
 // --- Cookies
 app.use(cookieParser());
 
 // ⛔️ Stripe exige RAW: on évite le JSON parser sur /webhook-stripe
 app.use((req, res, next) => {
-  if (req.originalUrl && req.originalUrl.startsWith('/webhook-stripe')) return next(); // ✅ startsWith pour fiabiliser
+  if (req.originalUrl && req.originalUrl.startsWith('/webhook-stripe')) return next();
   return bodyParser.json({ limit: '2mb' })(req, res, next);
 });
 
@@ -284,7 +305,6 @@ function findLicenceIndexByAnyId(list, licenceId) {
 // (facultatif) expose les métriques si tu veux les lire depuis une route /__metrics
 module.exports.__JSONBIN_METRICS__ = __METRICS__;
 
-
 // =======================
 //   Licence update helper
 // =======================
@@ -323,7 +343,7 @@ app.post('/licence/expediteur', async (req, res) => {
     let found = { idx: -1, licence: null };
     if (licenceId) found = findLicenceIndex(list, l => String(l.id) === String(licenceId));
     else if (opticienId) found = findLicenceIndex(list, l => String(l.opticien?.id) === String(opticienId));
-    if (found.idx === -1) return res.status(404).json({ success: false, error: 'LICENCE_INTROUVABLE' }); // ✅ uniformisé
+    if (found.idx === -1) return res.status(404).json({ success: false, error: 'LICENCE_INTROUVABLE' });
 
     list[found.idx].libelleExpediteur = cleaned;
     const bodyToPut = Array.isArray(rawRecord) ? list : list[found.idx];
@@ -474,6 +494,9 @@ function buildFinalMessage(rawMessage = '', signature = '') {
 }
 function toFRNumber(raw = '') {
   return String(raw).replace(/[^\d+]/g, '').replace(/^0/, '+33');
+}
+function ensureStopMention(text = '') {
+  return /stop\s+au\s+36111/i.test(String(text)) ? String(text) : `${String(text)}\nSTOP au 36111`;
 }
 
 // Middleware — prépare sender/signature + licence JSONBin
@@ -1040,10 +1063,6 @@ app.post('/send-promotional', applySenderAndSignature, async (req, res) => {
 
     const { sender, signature } = req.smsContext;
     const baseText = buildFinalMessage(message || '', signature || '');
-
-    function ensureStopMention(text) {
-      return /stop\s+au\s+36111/i.test(text) ? text : `${text}\nSTOP au 36111`;
-    }
     const finalMessage = ensureStopMention(baseText);
 
     const params = new URLSearchParams();
@@ -1515,7 +1534,7 @@ app.post('/webhook-stripe', express.raw({ type: 'application/json' }), async (re
   if (event.type === 'checkout.session.completed') {
     const session = event.data.object;
     const email = session.metadata?.email;
-    const quantity = parseInt(session.metadata?.quantity || '1');
+       const quantity = parseInt(session.metadata?.quantity || '1');
     if (email) {
       try {
         const { list, rawRecord } = await jsonbinGetAll();
@@ -1589,6 +1608,9 @@ async function findLicence({ cle, id }) {
   return null;
 }
 
+// 👇 burst limiter sur endpoints sensibles
+app.use(['/api/clients', '/api/licence', '/licence', '/api/licence/by-key', '/licence/by-key', '/licence-by-key'], burstLimiter);
+
 app.get(['/api/licence/by-key', '/licence/by-key', '/licence-by-key', '/api/licence', '/licence'], async (req, res) => {
   try {
     const cle = req.query.cle || req.query.key || req.query.k;
@@ -1598,7 +1620,7 @@ app.get(['/api/licence/by-key', '/licence/by-key', '/licence-by-key', '/api/lice
     const licence = await findLicence({ cle, id });
     if (!licence) return res.status(404).json({ error: 'LICENCE_INTROUVABLE' });
 
-    res.set('Cache-Control', 'no-store');
+    res.set('Cache-Control', 'public, max-age=15, stale-while-revalidate=60');
     return res.json({ licence });
   } catch (e) {
     console.error('❌ /licence/by-key error:', e);
@@ -1749,6 +1771,7 @@ app.get('/api/clients', async (req, res) => {
     if (idx === -1) return res.status(404).json({ error: 'LICENCE_INTROUVABLE' });
 
     const clients = Array.isArray(licence.clients) ? licence.clients : [];
+    res.set('Cache-Control', 'public, max-age=15, stale-while-revalidate=60');
     res.json({ items: clients.filter(c => !c.deletedAt) });
   } catch (e) {
     console.error('GET /api/clients', e);
@@ -1970,7 +1993,6 @@ function addMonthsISO(iso, months) {
   d.setUTCFullYear(targetY, targetMonth, Math.min(day, lastDay));
   return d.toISOString().slice(0,10);
 }
-function ensureStopMention(text) { return /stop\s+au\s+36111/i.test(text) ? text : `${text}\nSTOP au 36111`; }
 function renderTemplate(tpl, ctx) {
   return String(tpl || '')
     .replace(/\{prenom\}/gi, ctx.prenom || '')
@@ -1983,47 +2005,6 @@ function sameMonthDay(dateStr) {
   return today.slice(5) === iso.slice(5);
 }
 function pickClientPhone(c) { return c?.phone || c?.telephone || c?.mobile || c?.gsm || ''; }
-function computeLensEndISO(client) {
-  const end =
-    parseToISODate(client?.nextLensRenewal) ||
-    parseToISODate(client?.renouvellementLentilles) ||
-    parseToISODate(client?.renouvellement) ||
-    parseToISODate(client?.lensEndDate);
-  if (end) return end;
-
-  const start =
-    parseToISODate(client?.lensStartDate) ||
-    parseToISODate(client?.dateDernieresLentilles) ||
-    parseToISODate(client?.lastLensPurchase) ||
-    parseToISODate(client?.dateAchatLentilles);
-
-  if (!start) return null;
-
-  const days =
-    Number(client?.lensDurationDays) ||
-    Number(client?.renouvellementJours) ||
-    Number(client?.dureeLentillesJours) ||
-    Number(client?.cycleJours) || 0;
-
-  const months =
-    Number(client?.lensDurationMonths) ||
-    Number(client?.renouvellementMois) ||
-    Number(client?.dureeLentillesMois) || 0;
-
-  if (days > 0) return addDaysISO(start, days);
-  if (months > 0) return addMonthsISO(start, months);
-
-  const raw = String(client?.lensDuration || client?.dureeLentilles || '').trim().toLowerCase();
-  if (raw) {
-    const mJ = /^(\d+)\s*j/.exec(raw);
-    const mM = /^(\d+)\s*m/.exec(raw);
-    if (mJ) return addDaysISO(start, Number(mJ[1]));
-    if (mM) return addMonthsISO(start, Number(mM[1]));
-    const n = Number(raw);
-    if (Number.isFinite(n) && n > 0) return addDaysISO(start, n);
-  }
-  return null;
-}
 
 async function sendSmsAutoForLicence({ licence, list, rawRecord, idx, numero, text, type }) {
   if (!process.env.SMSMODE_LOGIN || !process.env.SMSMODE_PASSWORD) return { ok:false, reason:'SMSMODE_ENV_MISSING' };
@@ -2118,7 +2099,47 @@ cron.schedule('15 9 * * *', async () => {
         const advance = Number.isFinite(+a.lensAdvanceDays) ? +a.lensAdvanceDays : 10;
         const tpl = a.messageLensRenewal || 'Bonjour {prenom}, pensez au renouvellement de vos lentilles.';
         for (const c of clients) {
-          const endISO = computeLensEndISO(c);
+          const endISO = (function computeLensEndISO(client) {
+            const end =
+              parseToISODate(client?.nextLensRenewal) ||
+              parseToISODate(client?.renouvellementLentilles) ||
+              parseToISODate(client?.renouvellement) ||
+              parseToISODate(client?.lensEndDate);
+            if (end) return end;
+
+            const start =
+              parseToISODate(client?.lensStartDate) ||
+              parseToISODate(client?.dateDernieresLentilles) ||
+              parseToISODate(client?.lastLensPurchase) ||
+              parseToISODate(client?.dateAchatLentilles);
+            if (!start) return null;
+
+            const days =
+              Number(client?.lensDurationDays) ||
+              Number(client?.renouvellementJours) ||
+              Number(client?.dureeLentillesJours) ||
+              Number(client?.cycleJours) || 0;
+
+            const months =
+              Number(client?.lensDurationMonths) ||
+              Number(client?.renouvellementMois) ||
+              Number(client?.dureeLentillesMois) || 0;
+
+            if (days > 0) return addDaysISO(start, days);
+            if (months > 0) return addMonthsISO(start, months);
+
+            const raw = String(client?.lensDuration || client?.dureeLentilles || '').trim().toLowerCase();
+            if (raw) {
+              const mJ = /^(\d+)\s*j/.exec(raw);
+              const mM = /^(\d+)\s*m/.exec(raw);
+              if (mJ) return addDaysISO(start, Number(mJ[1]));
+              if (mM) return addMonthsISO(start, Number(mM[1]));
+              const n = Number(raw);
+              if (Number.isFinite(n) && n > 0) return addDaysISO(start, n);
+            }
+            return null;
+          })(c);
+
           if (!endISO) continue;
           const triggerISO = addDaysISO(endISO, -advance);
           if (triggerISO !== todayISO) continue;
