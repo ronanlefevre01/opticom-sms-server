@@ -48,7 +48,7 @@ const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const GO_CARDLESS_API_BASE = 'https://api.gocardless.com';
 const goCardlessClient = goCardless(
   process.env.GOCARDLESS_API_KEY,
-  process.env.GOCARDLESS_ENV || 'live'
+  { environment: process.env.GOCARDLESS_ENV || 'live' } // ✅ correct
 );
 
 // --- Sessions simples en mémoire
@@ -100,14 +100,12 @@ app.use(cors(corsOptions));
 // option B (recommandée, RegExp) :
 app.options(/.*/, cors(corsOptions));
 
-
-
 // --- Cookies
 app.use(cookieParser());
 
 // ⛔️ Stripe exige RAW: on évite le JSON parser sur /webhook-stripe
 app.use((req, res, next) => {
-  if (req.originalUrl === '/webhook-stripe') return next();
+  if (req.originalUrl && req.originalUrl.startsWith('/webhook-stripe')) return next(); // ✅ startsWith pour fiabiliser
   return bodyParser.json({ limit: '2mb' })(req, res, next);
 });
 
@@ -254,7 +252,7 @@ app.post('/licence/expediteur', async (req, res) => {
     let found = { idx: -1, licence: null };
     if (licenceId) found = findLicenceIndex(list, l => String(l.id) === String(licenceId));
     else if (opticienId) found = findLicenceIndex(list, l => String(l.opticien?.id) === String(opticienId));
-    if (found.idx === -1) return res.status(404).json({ success: false, error: 'LICENCE_INTRouvable' });
+    if (found.idx === -1) return res.status(404).json({ success: false, error: 'LICENCE_INTROUVABLE' }); // ✅ uniformisé
 
     list[found.idx].libelleExpediteur = cleaned;
     const bodyToPut = Array.isArray(rawRecord) ? list : list[found.idx];
@@ -515,14 +513,15 @@ app.get('/validation-mandat', async (req, res) => {
       { session_token: sessionToken }
     );
 
-    const flow = confirmResponse;
-    if (!flow || !flow.links || !flow.links.customer) {
+    // ✅ Supporte les deux formes { redirect_flows: {...} } ou {...}
+    const flowObj = confirmResponse?.redirect_flows || confirmResponse;
+    if (!flowObj || !flowObj.links || !flowObj.links.customer) {
       console.error('❌ Erreur GoCardless : réponse invalide', confirmResponse);
       return res.status(500).send('Erreur GoCardless : réponse invalide lors de la confirmation.');
     }
 
-    const customerId = flow.links.customer;
-    const mandateId  = flow.links.mandate;
+    const customerId = flowObj.links.customer;
+    const mandateId  = flowObj.links.mandate;
 
     const opt = sessionTokenMap.get(sessionToken);
     if (!opt) return res.status(400).send('Données opticien manquantes ou session expirée.');
@@ -1362,7 +1361,8 @@ app.post('/achat-credits-gocardless', async (req, res) => {
         details: `${creditsAjoutes} crédits achetés via GoCardless`
       };
 
-      const factureResponse = await fetch(`https://opticom-sms-server.onrender.com/api/generate-invoice`, {
+      const base = process.env.PUBLIC_SERVER_BASE || `https://opticom-sms-server.onrender.com`;
+      const factureResponse = await fetch(`${base}/api/generate-invoice`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(facturePayload)
@@ -1457,12 +1457,14 @@ app.post('/webhook-stripe', express.raw({ type: 'application/json' }), async (re
           const facturePayload = {
             opticien: list[idx].opticien,
             type: 'Achat de crédits SMS (Stripe)',
-            montant: 17 * quantity,
+            montant: 17 * quantity, // TTC
             details: `${creditsAjoutes} crédits achetés`
           };
           let invoiceUrl = null;
           try {
-            const response = await fetch(`http://localhost:${PORT}/api/generate-invoice`, {
+            const scheme = String(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0];
+            const base = process.env.PUBLIC_SERVER_BASE || `${scheme}://${req.get('host')}`;
+            const response = await fetch(`${base}/api/generate-invoice`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify(facturePayload)
@@ -1847,7 +1849,7 @@ cron.schedule('0 3 * * *', async () => {
   } catch (err) {
     console.error('❌ Erreur CRON:', err);
   }
-});
+}, { timezone: 'Europe/Paris' }); // ✅ TZ Paris
 
 // =======================
 //   Automatisations (anniv / lentilles)
@@ -2077,8 +2079,16 @@ cron.schedule('15 9 * * *', async () => {
 //   Facture PDF
 // =======================
 app.post('/api/generate-invoice', async (req, res) => {
-  const { opticien, type, montant, details } = req.body || {};
+  const { opticien, type, montant, details, montantHT, montantTTC, tva } = req.body || {};
   if (!opticien || !opticien.id) return res.status(400).json({ error: 'Opticien manquant ou invalide' });
+
+  // ✅ Supporte montant direct OU (HT/TVA/TTC)
+  let totalTTC = Number.isFinite(Number(montant)) ? Number(montant) : undefined;
+  if (typeof totalTTC === 'undefined') {
+    if (Number.isFinite(Number(montantTTC))) totalTTC = Number(montantTTC);
+    else if (Number.isFinite(Number(montantHT)) && Number.isFinite(Number(tva))) totalTTC = Number(montantHT) + Number(tva);
+  }
+  if (!Number.isFinite(totalTTC)) totalTTC = 0;
 
   const fileName = `facture-${opticien.id}-${uuidv4()}.pdf`;
   const filePath = path.join(__dirname, 'public/factures', fileName);
@@ -2087,7 +2097,7 @@ app.post('/api/generate-invoice', async (req, res) => {
   const stream = fs.createWriteStream(filePath);
   doc.pipe(stream);
 
-  doc.fontSize(20).text('📄 Facture OptiCOM', { align: 'center' });
+  doc.fontSize(20).text('Facture OptiCOM', { align: 'center' });
   doc.moveDown();
   doc.fontSize(12).text(`Nom : ${opticien.nom}`);
   doc.text(`SIRET : ${opticien.siret || '—'}`);
@@ -2095,7 +2105,11 @@ app.post('/api/generate-invoice', async (req, res) => {
   doc.text(`Téléphone : ${opticien.telephone || '—'}`);
   doc.moveDown();
   doc.text(`Type de facture : ${type}`);
-  doc.text(`Montant TTC : ${Number(montant).toFixed(2)} €`);
+  if (Number.isFinite(Number(montantHT)) && Number.isFinite(Number(tva))) {
+    doc.text(`Montant HT : ${Number(montantHT).toFixed(2)} €`);
+    doc.text(`TVA : ${Number(tva).toFixed(2)} €`);
+  }
+  doc.text(`Montant TTC : ${totalTTC.toFixed(2)} €`);
   doc.text(`Détails : ${details}`);
   doc.text(`Date : ${new Date().toLocaleDateString('fr-FR')}`);
   doc.end();
