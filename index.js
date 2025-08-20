@@ -911,43 +911,68 @@ async function appendSmsLogAndPersist({ list, rawRecord, idx, licence, entry }) 
 }
 
 // =======================
-//   Historique SMS : purge
+//  SMS History – purge
 // =======================
+
+// Handler commun
+async function purgeSmsHistory({ licenceId, all, numero, phoneNumber }) {
+  if (!licenceId) return { ok:false, status:400, error:'licenceId requis' };
+
+  const num = toFRNumber(numero || phoneNumber || '');
+  const { list, rawRecord } = await jsonbinGetAll();
+  const { idx, licence } = findLicenceIndex(list, l => String(l.id) === String(licenceId));
+  if (idx === -1) return { ok:false, status:404, error:'LICENCE_INTROUVABLE' };
+
+  const before = Array.isArray(licence.historiqueSms) ? licence.historiqueSms : [];
+  let after;
+
+  if (all === true) {
+    after = [];
+  } else if (num) {
+    const n = normalizeFR(num);
+    after = before.filter(h => normalizeFR(h.numero || '') !== n);
+  } else {
+    return { ok:false, status:400, error:'Précisez all:true ou numero' };
+  }
+
+  const removed = before.length - after.length;
+  licence.historiqueSms = after;
+  licence.updatedAt = new Date().toISOString();
+
+  const bodyToPut = Array.isArray(rawRecord) ? (list[idx] = licence, list) : licence;
+  await jsonbinPutAll(bodyToPut);
+
+  return { ok:true, removed };
+}
+
+// Purge TOTALE
 app.post(['/api/sms-history/erase', '/licence/history/erase'], async (req, res) => {
   try {
-    const { licenceId, all, numero, phoneNumber } = req.body || {};
-    if (!licenceId) return res.status(400).json({ ok:false, error:'licenceId requis' });
-
-    const num = toFRNumber(numero || phoneNumber || '');
-    const { list, rawRecord } = await jsonbinGetAll();
-    const { idx, licence } = findLicenceIndex(list, l => String(l.id) === String(licenceId));
-    if (idx === -1) return res.status(404).json({ ok:false, error:'LICENCE_INTROUVABLE' });
-
-    const before = Array.isArray(licence.historiqueSms) ? licence.historiqueSms : [];
-    let after;
-
-    if (all === true) {
-      after = [];
-    } else if (num) {
-      const n = normalizeFR(num);
-      after = before.filter(h => normalizeFR(h.numero || '') !== n);
-    } else {
-      return res.status(400).json({ ok:false, error:'Précisez all:true ou numero' });
-    }
-
-    const removed = before.length - after.length;
-    licence.historiqueSms = after;
-    licence.updatedAt = new Date().toISOString();
-
-    const bodyToPut = Array.isArray(rawRecord) ? (list[idx] = licence, list) : licence;
-    await jsonbinPutAll(bodyToPut);
-
-    return res.json({ ok:true, removed });
+    const result = await purgeSmsHistory(req.body || {});
+    if (result.ok) return res.json(result);
+    return res.status(result.status || 400).json(result);
   } catch (e) {
-    console.error('❌ purge historique:', e);
+    console.error('❌ purge historique (all):', e);
     return res.status(500).json({ ok:false, error:'SERVER_ERROR' });
   }
 });
+
+// Purge pour UN NUMÉRO
+app.post(
+  ['/api/sms-history/erase-for-number', '/licence/history/erase-for-number'],
+  async (req, res) => {
+    try {
+      const payload = { ...(req.body || {}), all: false };
+      const result = await purgeSmsHistory(payload);
+      if (result.ok) return res.json(result);
+      return res.status(result.status || 400).json(result);
+    } catch (e) {
+      console.error('❌ purge historique (num):', e);
+      return res.status(500).json({ ok:false, error:'SERVER_ERROR' });
+    }
+  }
+);
+
 
 // Variante "un numéro" conviviale
 app.post(
