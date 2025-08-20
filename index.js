@@ -331,11 +331,7 @@ async function withJsonbinUpdate(mutator) {
 // (facultatif) expose les métriques si tu veux les lire depuis une route /__metrics
 module.exports.__JSONBIN_METRICS__ = __METRICS__;
 
-// ---- Champs licence protégés (ne doivent JAMAIS être écrasés par une sync générique)
-const PROTECTED_FIELDS = new Set([
-  'libelleExpediteur',
-  'signature',
-]);
+
 
 function mergeWithProtection(oldObj = {}, patch = {}, allowKeys = []) {
   const allow = new Set(allowKeys);
@@ -351,6 +347,23 @@ function mergeWithProtection(oldObj = {}, patch = {}, allowKeys = []) {
 // =======================
 //   Licence update helper
 // =======================
+
+// Champs protégés: jamais écrasés par une sync générique
+const PROTECTED_FIELDS = new Set([
+  'libelleExpediteur', 'signature',
+  'historiqueSms', 'smsHistoryTombstones' // ← historique & tombstones
+]);
+
+function stripProtectedFields(patch = {}, allowKeys = []) {
+  const allow = new Set(allowKeys);
+  const out = {};
+  for (const [k, v] of Object.entries(patch || {})) {
+    if (PROTECTED_FIELDS.has(k) && !allow.has(k)) continue; // on ignore
+    out[k] = v;
+  }
+  return out;
+}
+
 async function updateLicenceFields({ licenceId, opticienId, patch = {}, allowKeys = [] }) {
   const { list, rawRecord } = await jsonbinGetAll();
 
@@ -360,16 +373,22 @@ async function updateLicenceFields({ licenceId, opticienId, patch = {}, allowKey
       (licenceId && String(l.id) === String(licenceId)) ||
       (opticienId && String(l.opticien?.id) === String(opticienId))
   );
-  if (idx === -1 || !licence) {
-    return { ok: false, status: 404, error: 'LICENCE_NOT_FOUND' };
+  if (idx === -1 || !licence) return { ok:false, status:404, error:'LICENCE_NOT_FOUND' };
+
+  const safePatch = stripProtectedFields(patch, allowKeys);
+  const updated = { ...licence, ...safePatch, updatedAt: new Date().toISOString() };
+
+  // ⚠️ si on a explicitement le droit de modifier historiqueSms on garde l’existant fusionné
+  if (allowKeys.includes('historiqueSms') && Array.isArray(patch.historiqueSms)) {
+    updated.historiqueSms = patch.historiqueSms;
   }
 
-  const updated = mergeWithProtection(licence, patch, allowKeys);
   const bodyToPut = Array.isArray(rawRecord) ? (list[idx] = updated, list) : updated;
   await jsonbinPutAll(bodyToPut);
 
-  return { ok: true, licence: updated };
+  return { ok:true, licence: updated };
 }
+
 
 
 
@@ -389,16 +408,17 @@ app.post('/licence/expediteur', async (req, res) => {
       licenceId,
       opticienId,
       patch: { libelleExpediteur: cleaned },
-      allowKeys: ['libelleExpediteur'] // ✅ on autorise l’écrasement explicite
+      allowKeys: ['libelleExpediteur'] // ⬅️ autorise l'écrasement durable
     });
-    if (!result.ok) return res.status(result.status || 500).json({ success:false, error: result.error });
+    if (!result.ok) return res.status(result.status || 500).json({ success: false, error: result.error });
 
-    return res.json({ success: true, licence: result.licence });
+    res.json({ success: true, licence: result.licence });
   } catch (e) {
     console.error('❌ /licence/expediteur error:', e);
     res.status(500).json({ success: false, error: 'SERVER_ERROR' });
   }
 });
+
 
 // Signature – écrase la valeur JSONBin (autorisé)
 app.post('/licence/signature', async (req, res) => {
@@ -412,7 +432,7 @@ app.post('/licence/signature', async (req, res) => {
       licenceId,
       opticienId,
       patch: { signature: clean },
-      allowKeys: ['signature'] // ✅ autoriser l’écrasement explicite
+      allowKeys: ['signature'] // ⬅️ autorise l'écrasement durable
     });
 
     if (!result.ok) return res.status(result.status || 500).json({ success: false, error: result.error });
@@ -422,6 +442,7 @@ app.post('/licence/signature', async (req, res) => {
     res.status(500).json({ success: false, error: 'SERVER_ERROR' });
   }
 });
+
 
 
 
@@ -874,17 +895,21 @@ async function markOptOut(licenceId, phoneE164) {
   await jsonbinPutAll(Array.isArray(rawRecord) ? list : list[idx]);
   return true;
 }
-async function appendSmsLogAndPersist({ licenceId, entry }) {
-  await withJsonbinUpdate(({ list }) => {
-    const { idx, licence } = findLicenceIndex(list, l => String(l.id) === String(licenceId));
-    if (idx === -1) return { __skipSave: true };
-    const lic = list[idx];
-    lic.historiqueSms = Array.isArray(lic.historiqueSms) ? lic.historiqueSms : [];
-    lic.historiqueSms.push(entry);
-    lic.updatedAt = new Date().toISOString();
-    return { licence: lic };
-  });
+async function appendSmsLogAndPersist({ list, rawRecord, idx, licence, entry }) {
+  // Assure un id sur l'entrée
+  if (!entry.id) entry.id = uuidv4();
+
+  // Ne ré-ajoute pas un item supprimé
+  const tomb = new Set(licence.smsHistoryTombstones || []);
+  if (tomb.has(String(entry.id)) || (entry.textHash && tomb.has(String(entry.textHash)))) return;
+
+  licence.historiqueSms = Array.isArray(licence.historiqueSms) ? licence.historiqueSms : [];
+  licence.historiqueSms.push(entry);
+
+  const bodyToPut = Array.isArray(rawRecord) ? (list[idx] = licence, list) : licence;
+  await jsonbinPutAll(bodyToPut);
 }
+
 
 
 // --- Opt-out
@@ -1227,6 +1252,67 @@ app.post('/send-promotional', applySenderAndSignature, async (req, res) => {
     res.status(500).json({ success: false, error: String(err.message || err) });
   }
 });
+
+// --- Historique SMS : suppression d'éléments ciblés
+app.post('/api/sms/history/delete', async (req, res) => {
+  try {
+    const { licenceId, ids = [], textHashes = [] } = req.body || {};
+    if (!licenceId) return res.status(400).json({ ok:false, error:'PARAMS' });
+
+    const { list, rawRecord } = await jsonbinGetAll();
+    const { idx, licence } = findLicenceIndex(list, l => String(l.id) === String(licenceId));
+    if (idx === -1 || !licence) return res.status(404).json({ ok:false, error:'LICENCE_INTROUVABLE' });
+
+    const before = Array.isArray(licence.historiqueSms) ? licence.historiqueSms : [];
+    const idSet = new Set((ids || []).map(String));
+    const thSet = new Set((textHashes || []).map(String));
+
+    const tomb = new Set(licence.smsHistoryTombstones || []);
+    for (const it of before) {
+      if ((it.id && idSet.has(String(it.id))) || (it.textHash && thSet.has(String(it.textHash)))) {
+        tomb.add(String(it.id || it.textHash));
+      }
+    }
+    licence.smsHistoryTombstones = Array.from(tomb);
+
+    const after = before.filter(it => !tomb.has(String(it.id || it.textHash)));
+    licence.historiqueSms = after;
+    licence.updatedAt = new Date().toISOString();
+
+    await jsonbinPutAll(Array.isArray(rawRecord) ? (list[idx] = licence, list) : licence);
+    res.json({ ok:true, removed: before.length - after.length, total: after.length });
+  } catch (e) {
+    console.error('❌ /api/sms/history/delete', e);
+    res.status(500).json({ ok:false, error:'SERVER_ERROR' });
+  }
+});
+
+// --- Historique SMS : vider entièrement
+app.post('/api/sms/history/clear', async (req, res) => {
+  try {
+    const { licenceId } = req.body || {};
+    if (!licenceId) return res.status(400).json({ ok:false, error:'PARAMS' });
+
+    const { list, rawRecord } = await jsonbinGetAll();
+    const { idx, licence } = findLicenceIndex(list, l => String(l.id) === String(licenceId));
+    if (idx === -1 || !licence) return res.status(404).json({ ok:false, error:'LICENCE_INTROUVABLE' });
+
+    const before = Array.isArray(licence.historiqueSms) ? licence.historiqueSms : [];
+    const tomb = new Set(licence.smsHistoryTombstones || []);
+    for (const it of before) tomb.add(String(it.id || it.textHash));
+    licence.smsHistoryTombstones = Array.from(tomb);
+
+    licence.historiqueSms = [];
+    licence.updatedAt = new Date().toISOString();
+
+    await jsonbinPutAll(Array.isArray(rawRecord) ? (list[idx] = licence, list) : licence);
+    res.json({ ok:true, removed: before.length });
+  } catch (e) {
+    console.error('❌ /api/sms/history/clear', e);
+    res.status(500).json({ ok:false, error:'SERVER_ERROR' });
+  }
+});
+
 
 
 // =======================
@@ -1718,33 +1804,59 @@ async function findLicence({ cle, id }) {
 // 👇 burst limiter sur endpoints sensibles
 app.use(['/api/clients', '/api/licence', '/licence', '/api/licence/by-key', '/licence/by-key', '/licence-by-key'], burstLimiter);
 
-app.get(['/api/licence/by-key', '/licence/by-key', '/licence-by-key', '/api/licence', '/licence'], async (req, res) => {
-  try {
-    const cle = req.query.cle || req.query.key || req.query.k;
-    const id  = req.query.id;
-    if (!cle && !id) return res.status(400).json({ error: 'Paramètre cle ou id requis' });
+app.get(
+  ['/api/licence/by-key', '/licence/by-key', '/licence-by-key', '/api/licence', '/licence'],
+  async (req, res) => {
+    try {
+      const cle = req.query.cle || req.query.key || req.query.k;
+      const id  = req.query.id;
+      if (!cle && !id) return res.status(400).json({ error: 'Paramètre cle ou id requis' });
 
-    const licence = await findLicence({ cle, id });
-    if (!licence) return res.status(404).json({ error: 'LICENCE_INTROUVABLE' });
+      const licence = await findLicence({ cle, id });
+      if (!licence) return res.status(404).json({ error: 'LICENCE_INTROUVABLE' });
 
-    res.set('Cache-Control', 'public, max-age=15, stale-while-revalidate=60');
-    return res.json({ licence });
-  } catch (e) {
-    console.error('❌ /licence/by-key error:', e);
-    return res.status(500).json({ error: 'SERVER_ERROR' });
+      // ⬇️ On renvoie une copie filtrée (évite de muter l’original)
+      const clone = JSON.parse(JSON.stringify(licence));
+      const tomb = new Set(clone.smsHistoryTombstones || []);
+      if (Array.isArray(clone.historiqueSms) && tomb.size) {
+        clone.historiqueSms = clone.historiqueSms.filter(
+          it => !tomb.has(String(it.id || it.textHash))
+        );
+      }
+
+      res.set('Cache-Control', 'public, max-age=15, stale-while-revalidate=60');
+      return res.json({ licence: clone });
+    } catch (e) {
+      console.error('❌ /licence/by-key error:', e);
+      return res.status(500).json({ error: 'SERVER_ERROR' });
+    }
   }
-});
+);
+
 
 app.get('/api/licences', async (_req, res) => {
   try {
     const { list } = await jsonbinGetAll();
-    res.json(Array.isArray(list) ? list : (list ? [list] : []));
+    const items = (Array.isArray(list) ? list : (list ? [list] : []))
+      .map((lic) => {
+        const clone = JSON.parse(JSON.stringify(lic));
+        const tomb = new Set(clone.smsHistoryTombstones || []);
+        if (Array.isArray(clone.historiqueSms) && tomb.size) {
+          clone.historiqueSms = clone.historiqueSms.filter(
+            it => !tomb.has(String(it.id || it.textHash))
+          );
+        }
+        return clone;
+      });
+    res.json(items);
   } catch (e) {
     console.error('❌ /api/licences error:', e);
     res.status(500).json({ error: 'JSONBIN_READ_FAILED', detail: String(e.message || e) });
   }
 });
 
+
+// Le client envoie un patch partiel { ... } — les PROTECTED_FIELDS sont conservés
 // Le client envoie un patch partiel { ... } — les PROTECTED_FIELDS sont conservés
 app.post('/api/licence/sync-safe', async (req, res) => {
   try {
@@ -1752,15 +1864,47 @@ app.post('/api/licence/sync-safe', async (req, res) => {
     if (!licenceId || typeof patch !== 'object') {
       return res.status(400).json({ ok:false, error:'PARAMS' });
     }
-    // Ne PAS permettre d’écraser libelleExpediteur/signature ici
-    const result = await updateLicenceFields({ licenceId, patch, allowKeys: [] });
-    if (!result.ok) return res.status(result.status || 500).json({ ok:false, error: result.error });
-    res.json({ ok:true, licence: result.licence });
+
+    // 🔎 On récupère la licence pour connaître ses tombstones
+    const { list } = await jsonbinGetAll();
+    const { idx, licence } = findLicenceIndex(list, l => String(l.id) === String(licenceId));
+    if (idx === -1 || !licence) return res.status(404).json({ ok:false, error:'LICENCE_INTROUVABLE' });
+
+    // ⛔️ Empêche la resync d’écraser libellé/signature etc.
+    const protectedKeys = new Set(['libelleExpediteur', 'signature', 'smsHistoryTombstones']);
+    const safePatch = Object.fromEntries(
+      Object.entries(patch).filter(([k]) => !protectedKeys.has(k))
+    );
+
+    // 🧹 Si on reçoit un historique dans le patch, on enlève les items tombstonés
+    if (Array.isArray(safePatch.historiqueSms)) {
+      const tomb = new Set(licence.smsHistoryTombstones || []);
+      safePatch.historiqueSms = safePatch.historiqueSms.filter(
+        it => !tomb.has(String(it.id || it.textHash))
+      );
+    }
+
+    // 👉 updateLicenceFields (ta version avec allowKeys) préservera de toute façon les champs protégés
+    const r = await updateLicenceFields({ licenceId, patch: safePatch, allowKeys: [] });
+    if (!r.ok) return res.status(r.status || 500).json({ ok:false, error:r.error });
+
+    // On renvoie aussi une licence filtrée (comme les GET)
+    const clone = JSON.parse(JSON.stringify(r.licence));
+    const tomb = new Set(clone.smsHistoryTombstones || []);
+    if (Array.isArray(clone.historiqueSms) && tomb.size) {
+      clone.historiqueSms = clone.historiqueSms.filter(
+        it => !tomb.has(String(it.id || it.textHash))
+      );
+    }
+
+    res.json({ ok:true, licence: clone });
   } catch (e) {
     console.error('❌ /api/licence/sync-safe', e);
     res.status(500).json({ ok:false, error:'SERVER_ERROR' });
   }
 });
+
+
 
 
 // =======================
