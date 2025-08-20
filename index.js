@@ -331,28 +331,52 @@ async function withJsonbinUpdate(mutator) {
 // (facultatif) expose les métriques si tu veux les lire depuis une route /__metrics
 module.exports.__JSONBIN_METRICS__ = __METRICS__;
 
+// ---- Champs licence protégés (ne doivent JAMAIS être écrasés par une sync générique)
+const PROTECTED_FIELDS = new Set([
+  'libelleExpediteur',
+  'signature',
+]);
+
+function mergeWithProtection(oldObj = {}, patch = {}, allowKeys = []) {
+  const allow = new Set(allowKeys);
+  const out = { ...oldObj };
+  for (const [k, v] of Object.entries(patch || {})) {
+    if (PROTECTED_FIELDS.has(k) && !allow.has(k)) continue; // on ignore toute tentative d'écraser
+    out[k] = v;
+  }
+  out.updatedAt = new Date().toISOString();
+  return out;
+}
+
 // =======================
 //   Licence update helper
 // =======================
-async function updateLicenceFields({ licenceId, opticienId, patch = {} }) {
-  const res = await withJsonbinUpdate(({ list }) => {
-    const { idx, licence } = findLicenceIndex(
-      list,
-      (l) =>
-        (licenceId && String(l.id) === String(licenceId)) ||
-        (opticienId && String(l.opticien?.id) === String(opticienId))
-    );
-    if (idx === -1 || !licence) return { ok: false, status: 404, error: 'LICENCE_NOT_FOUND', __skipSave: true };
-    list[idx] = { ...licence, ...patch, updatedAt: new Date().toISOString() };
-    return { ok: true, licence: list[idx] };
-  });
-  return res;
+async function updateLicenceFields({ licenceId, opticienId, patch = {}, allowKeys = [] }) {
+  const { list, rawRecord } = await jsonbinGetAll();
+
+  const { idx, licence } = findLicenceIndex(
+    list,
+    (l) =>
+      (licenceId && String(l.id) === String(licenceId)) ||
+      (opticienId && String(l.opticien?.id) === String(opticienId))
+  );
+  if (idx === -1 || !licence) {
+    return { ok: false, status: 404, error: 'LICENCE_NOT_FOUND' };
+  }
+
+  const updated = mergeWithProtection(licence, patch, allowKeys);
+  const bodyToPut = Array.isArray(rawRecord) ? (list[idx] = updated, list) : updated;
+  await jsonbinPutAll(bodyToPut);
+
+  return { ok: true, licence: updated };
 }
+
 
 
 // =======================
 //   Licence: expéditeur
 // =======================
+// Libellé expéditeur – écrase la valeur JSONBin (autorisé)
 app.post('/licence/expediteur', async (req, res) => {
   try {
     const { licenceId, opticienId, libelleExpediteur } = req.body || {};
@@ -361,26 +385,44 @@ app.post('/licence/expediteur', async (req, res) => {
     const cleaned = String(libelleExpediteur).replace(/[^a-zA-Z0-9]/g, '').slice(0, 11);
     if (cleaned.length < 3) return res.status(400).json({ success: false, error: 'LIBELLE_INVALIDE' });
 
-    const result = await withJsonbinUpdate(({ list }) => {
-      const { idx, licence } = findLicenceIndex(
-        list,
-        (l) =>
-          (licenceId && String(l.id) === String(licenceId)) ||
-          (opticienId && String(l.opticien?.id) === String(opticienId))
-      );
-      if (idx === -1 || !licence) return { __skipSave: true, status: 404 };
-      list[idx].libelleExpediteur = cleaned;
-      list[idx].updatedAt = new Date().toISOString();
-      return { licence: list[idx] };
+    const result = await updateLicenceFields({
+      licenceId,
+      opticienId,
+      patch: { libelleExpediteur: cleaned },
+      allowKeys: ['libelleExpediteur'] // ✅ on autorise l’écrasement explicite
     });
+    if (!result.ok) return res.status(result.status || 500).json({ success:false, error: result.error });
 
-    if (result?.status === 404) return res.status(404).json({ success: false, error: 'LICENCE_INTROUVABLE' });
-    res.json({ success: true, licence: result.licence });
+    return res.json({ success: true, licence: result.licence });
   } catch (e) {
     console.error('❌ /licence/expediteur error:', e);
     res.status(500).json({ success: false, error: 'SERVER_ERROR' });
   }
 });
+
+// Signature – écrase la valeur JSONBin (autorisé)
+app.post('/licence/signature', async (req, res) => {
+  try {
+    const { licenceId, opticienId, signature } = req.body || {};
+    if (typeof signature !== 'string') return res.status(400).json({ success: false, error: 'SIGNATURE_MANQUANTE' });
+
+    const clean = String(signature).trim().slice(0, 200);
+
+    const result = await updateLicenceFields({
+      licenceId,
+      opticienId,
+      patch: { signature: clean },
+      allowKeys: ['signature'] // ✅ autoriser l’écrasement explicite
+    });
+
+    if (!result.ok) return res.status(result.status || 500).json({ success: false, error: result.error });
+    return res.json({ success: true, licence: result.licence });
+  } catch (e) {
+    console.error('❌ /licence/signature error:', e);
+    res.status(500).json({ success: false, error: 'SERVER_ERROR' });
+  }
+});
+
 
 
 // =======================
@@ -529,29 +571,28 @@ function ensureStopMention(text = '') {
 // Middleware — prépare sender/signature + licence JSONBin
 async function applySenderAndSignature(req, res, next) {
   try {
-    const { sender, signature: sigFromClient, licenceId, opticienId } = req.body || {};
+    const { licenceId, opticienId } = req.body || {};
     const { list, rawRecord } = await jsonbinGetAll();
 
-    let { idx, licence } = findLicenceIndex(
+    const { idx, licence } = findLicenceIndex(
       list,
       (l) =>
         (licenceId && String(l.id) === String(licenceId)) ||
         (opticienId && String(l.opticien?.id) === String(opticienId))
     );
 
-    const candidateSender = sender || licence?.libelleExpediteur || licence?.opticien?.enseigne || 'OptiCOM';
-    const normalizedSender = normalizeSender(candidateSender);
-    const signatureFromLicence = licence?.signature || '';
-    const chosenSignature = (sigFromClient || signatureFromLicence || '').trim();
+    const savedSender = (licence?.libelleExpediteur || licence?.opticien?.enseigne || 'OptiCOM').trim();
+    const savedSignature = (licence?.signature || '').trim();
 
     req._jsonbin = { list, rawRecord, idx, licence };
-    req.smsContext = { licence, idx, sender: normalizedSender, signature: chosenSignature };
+    req.smsContext = { licence, idx, sender: normalizeSender(savedSender), signature: savedSignature };
     next();
   } catch (e) {
     console.error('applySenderAndSignature error:', e);
     res.status(500).json({ success: false, error: 'SERVER_SIGNATURE_SENDER_MIDDLEWARE_FAILED' });
   }
 }
+
 
 // ===============================
 //   GoCardless: mandat & licence
@@ -1703,6 +1744,24 @@ app.get('/api/licences', async (_req, res) => {
     res.status(500).json({ error: 'JSONBIN_READ_FAILED', detail: String(e.message || e) });
   }
 });
+
+// Le client envoie un patch partiel { ... } — les PROTECTED_FIELDS sont conservés
+app.post('/api/licence/sync-safe', async (req, res) => {
+  try {
+    const { licenceId, patch } = req.body || {};
+    if (!licenceId || typeof patch !== 'object') {
+      return res.status(400).json({ ok:false, error:'PARAMS' });
+    }
+    // Ne PAS permettre d’écraser libelleExpediteur/signature ici
+    const result = await updateLicenceFields({ licenceId, patch, allowKeys: [] });
+    if (!result.ok) return res.status(result.status || 500).json({ ok:false, error: result.error });
+    res.json({ ok:true, licence: result.licence });
+  } catch (e) {
+    console.error('❌ /api/licence/sync-safe', e);
+    res.status(500).json({ ok:false, error:'SERVER_ERROR' });
+  }
+});
+
 
 // =======================
 //   Préférences auto
