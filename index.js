@@ -264,7 +264,8 @@ async function jsonbinGetAll(force = false) {
     }
     const data = await r.json();
     const record = data?.record ?? data;
-    const list = Array.isArray(record) ? record : [record];
+    const list = Array.isArray(record) ? record : (record ? [record] : []);
+
 
     const payload = { list, rawRecord: record };
     __jsonbinCache = { data: payload, expires: now + JSONBIN_CACHE_TTL_MS };
@@ -321,20 +322,14 @@ function findLicenceIndexByAnyId(list, licenceId) {
 // --- Serialize JSONBin writes & always merge on latest snapshot ---
 let __jsonbinWriteChain = Promise.resolve();
 
-/**
- * Exécute mutator sur l'état *le plus récent* (force=true), sérialise les écritures,
- * et fait un PUT unique. Le mutator DOIT muter `list` in-place.
- * La valeur retournée par le mutator est renvoyée à l'appelant.
- * Pour annuler la sauvegarde, retourne { __skipSave: true }.
- */
 async function withJsonbinUpdate(mutator) {
   let out;
   __jsonbinWriteChain = __jsonbinWriteChain.then(async () => {
-    const state = await jsonbinGetAll(true); // ⬅️ bypass cache pour éviter l'ancien état
+    const state = await jsonbinGetAll(true); // snapshot frais
     out = (await mutator(state)) || {};
     if (out.__skipSave) return;
-    const toPut = Array.isArray(state.rawRecord) ? state.list : (Array.isArray(state.list) ? state.list[0] || {} : state.list);
-    await jsonbinPutAll(toPut);
+    // ⬇️ on écrit TOUJOURS un ARRAY pour uniformiser le schéma du BIN
+    await jsonbinPutAll(state.list);
   }).catch((e) => {
     console.error('withJsonbinUpdate failed:', e);
     throw e;
@@ -342,6 +337,8 @@ async function withJsonbinUpdate(mutator) {
   await __jsonbinWriteChain;
   return out;
 }
+
+
 
 // (facultatif) expose les métriques si tu veux les lire depuis une route /__metrics
 module.exports.__JSONBIN_METRICS__ = __METRICS__;
@@ -772,6 +769,35 @@ app.post('/create-mandat', async (req, res) => {
   }
 });
 
+async function saveLicenceDirectToJsonBin(newLicence) {
+  const binId = must(JSONBIN_BIN_ID, 'JSONBIN_BIN_ID');
+  const apiKey = must(JSONBIN_KEY, 'JSONBIN_KEY');
+
+  const getResponse = await axios.get(`https://api.jsonbin.io/v3/b/${binId}/latest`, {
+    headers: { 'X-Master-Key': apiKey, 'X-Bin-Meta': 'false' }
+  });
+
+  const record = getResponse.data?.record ?? getResponse.data;
+  const list   = Array.isArray(record) ? record : (record ? [record] : []);
+
+  const exists = list.some(l =>
+    String(l.licence || '').trim().toUpperCase() === String(newLicence.licence).trim().toUpperCase() ||
+    String(l.mandateId || '') === String(newLicence.mandateId) ||
+    String(l.customerId || '') === String(newLicence.customerId)
+  );
+  if (!exists) list.push(newLicence);
+
+  await axios.put(`https://api.jsonbin.io/v3/b/${binId}`, list, {
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Master-Key': apiKey,
+      'X-Bin-Versioning': 'false'
+    }
+  });
+}
+
+
+
 app.get('/validation-mandat', async (req, res) => {
   const redirectFlowId = req.query.redirect_flow_id;
   const sessionToken   = req.query.session_token;
@@ -839,11 +865,27 @@ app.get('/validation-mandat', async (req, res) => {
       customerId
     };
 
-    // ✅ Sauvegarde JSONBin via helper (gère cache et schéma array/single)
-    await withJsonbinUpdate(async ({ list }) => {
-      list.push(newLicence);
-      return {};
-    });
+    // ✅ Sauvegarde JSONBin (array) – anti-doublon + fallback direct
+try {
+  await withJsonbinUpdate(async ({ list }) => {
+    const exists = list.some(l =>
+      String(l.licence || '').trim().toUpperCase() === String(licenceKey).trim().toUpperCase() ||
+      String(l.mandateId || '') === String(mandateId) ||
+      String(l.customerId || '') === String(customerId)
+    );
+    if (!exists) list.push(newLicence);
+    return {};
+  });
+} catch (e) {
+  console.warn('withJsonbinUpdate KO, fallback direct JSONBin…', e?.message || e);
+  try {
+    await saveLicenceDirectToJsonBin(newLicence);
+  } catch (e2) {
+    console.error('❌ Échec sauvegarde JSONBin (fallback):', e2);
+    // on continue quand même pour afficher la page
+  }
+}
+
 
     sessionTokenMap.delete(sessionToken);
 
@@ -852,9 +894,11 @@ app.get('/validation-mandat', async (req, res) => {
     }
 
     const APP_URL = (process.env.PUBLIC_APP_URL || process.env.PUBLIC_WEB_APP_URL || '').trim();
-    const appBase = APP_URL.replace(/\/+$/, '');
-    const webDeeplink = appBase ? `${appBase}/licence?licence=${encodeURIComponent(licenceKey)}` : '';
-    const schemeDeeplink = `opticom://licence?licence=${encodeURIComponent(licenceKey)}`;
+const appBase = APP_URL.replace(/\/+$/, '');
+
+// 🔁 cible explicitement l'écran LicencePage
+const webDeeplink   = appBase ? `${appBase}/LicencePage?licence=${encodeURIComponent(licenceKey)}` : '';
+const schemeDeeplink = `opticom://LicencePage?licence=${encodeURIComponent(licenceKey)}`;
 
     res.send(`
       <html>
@@ -910,7 +954,7 @@ app.get('/validation-mandat', async (req, res) => {
                 await navigator.clipboard.writeText(txt);
               } catch (e) {}
 
-              var s = 5;
+              var s = 10;
               var el = document.getElementById('sec');
               var timer = setInterval(function(){
                 s--; if (el) el.textContent = String(s);
