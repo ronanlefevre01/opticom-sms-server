@@ -322,21 +322,38 @@ function findLicenceIndexByAnyId(list, licenceId) {
 // --- Serialize JSONBin writes & always merge on latest snapshot ---
 let __jsonbinWriteChain = Promise.resolve();
 
+/**
+ * Exécute mutator sur l’état le plus récent (force=true),
+ * sérialise les écritures et fait un PUT unique.
+ * Le mutator DOIT muter `list` in-place (ex: list.push(item)).
+ * Retourne la valeur de mutator. Pour annuler la sauvegarde, retourner { __skipSave: true }.
+ */
 async function withJsonbinUpdate(mutator) {
   let out;
   __jsonbinWriteChain = __jsonbinWriteChain.then(async () => {
-    const state = await jsonbinGetAll(true); // snapshot frais
+    // Récupère toujours le snapshot le plus frais
+    const state = await jsonbinGetAll(true); // { list, rawRecord }
+    // Laisse le mutator modifier list IN-PLACE
     out = (await mutator(state)) || {};
     if (out.__skipSave) return;
-    // ⬇️ on écrit TOUJOURS un ARRAY pour uniformiser le schéma du BIN
-    await jsonbinPutAll(state.list);
+
+    // ⚠️ IMPORTANT : on écrit TOUJOURS un TABLEAU dans le BIN
+    // (si le BIN était un objet, on le "convertit" en tableau – plus sûr pour accumuler des licences)
+    await jsonbinPutAll(Array.isArray(state.list) ? state.list : []);
   }).catch((e) => {
     console.error('withJsonbinUpdate failed:', e);
     throw e;
   });
+  console.log('✅ JSONBin sauvegardé:', {
+  bin: process.env.JSONBIN_BIN_ID,
+  count: Array.isArray(state.list) ? state.list.length : 0
+});
+
+
   await __jsonbinWriteChain;
   return out;
 }
+
 
 
 
