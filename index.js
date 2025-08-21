@@ -149,6 +149,21 @@ app.use((req, res, next) => {
 // --- Statiques généraux
 app.use('/public', express.static('public'));
 
+// --- Légal (sert /legal/*.md depuis public/legal)
+app.use(
+  '/legal',
+  express.static(path.join(__dirname, 'public', 'legal'), {
+    index: false,
+    maxAge: '1y',
+    setHeaders: (res, filePath) => {
+      if (filePath.endsWith('.md')) {
+        res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
+      }
+    },
+  })
+);
+
+
 // --- Route de test JSONBin data (temporaire, si présente)
 try {
   app.use(require('./routes/_devJsonbinTest'));
