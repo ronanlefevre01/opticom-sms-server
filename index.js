@@ -41,6 +41,7 @@ const fetch = globalThis.fetch.bind(globalThis);
 
 const app = express();
 
+
 // --- Metrics ultra-simples
 const metrics = { byPath: new Map() };
 app.use((req, _res, next) => {
@@ -126,15 +127,17 @@ const allowedOrigins = [
 const corsOptions = {
   origin(origin, cb) {
     if (!origin) return cb(null, true); // cURL / Postman
-    cb(allowedOrigins.includes(origin) ? null : new Error('Not allowed by CORS'), allowedOrigins.includes(origin));
+    const ok = allowedOrigins.includes(origin);
+    cb(ok ? null : new Error('Not allowed by CORS'), ok);
   },
-  methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'], // <- PUT ajouté
+  allowedHeaders: ['Content-Type','Authorization'],
   credentials: true
 };
 app.use((req, res, next) => { res.setHeader('Vary', 'Origin'); next(); });
 app.use(cors(corsOptions));
-app.options(/.*/, cors(corsOptions)); // preflight
+app.options(/.*/, cors(corsOptions)); // préflights
+
 
 // --- Cookies
 app.use(cookieParser());
@@ -396,79 +399,71 @@ async function updateLicenceFields({ licenceId, opticienId, patch = {}, allowKey
 //   Licence: expéditeur
 // =======================
 // Libellé expéditeur – écrase la valeur JSONBin (autorisé)
-app.post('/licence/expediteur', async (req, res) => {
+// =======================
+//   Licence: expéditeur & signature
+// =======================
+
+async function handleSaveSender(req, res) {
   try {
     const { licenceId, opticienId, libelleExpediteur } = req.body || {};
-    if (!libelleExpediteur) return res.status(400).json({ success: false, error: 'LIBELLE_MANQUANT' });
+    if (!libelleExpediteur) return res.status(400).json({ success:false, error:'LIBELLE_MANQUANT' });
 
     const cleaned = String(libelleExpediteur).replace(/[^a-zA-Z0-9]/g, '').slice(0, 11);
-    if (cleaned.length < 3) return res.status(400).json({ success: false, error: 'LIBELLE_INVALIDE' });
+    if (cleaned.length < 3) return res.status(400).json({ success:false, error:'LIBELLE_INVALIDE' });
 
     const result = await updateLicenceFields({
       licenceId,
       opticienId,
       patch: { libelleExpediteur: cleaned },
-      allowKeys: ['libelleExpediteur'] // ⬅️ autorise l'écrasement durable
+      allowKeys: ['libelleExpediteur']
     });
-    if (!result.ok) return res.status(result.status || 500).json({ success: false, error: result.error });
+    if (!result.ok) return res.status(result.status || 500).json({ success:false, error: result.error });
 
-    res.json({ success: true, licence: result.licence });
+    return res.json({ success:true, licence: result.licence });
   } catch (e) {
     console.error('❌ /licence/expediteur error:', e);
-    res.status(500).json({ success: false, error: 'SERVER_ERROR' });
+    return res.status(500).json({ success:false, error:'SERVER_ERROR' });
   }
-});
+}
 
-
-// Signature – écrase la valeur JSONBin (autorisé)
-app.post('/licence/signature', async (req, res) => {
+async function handleSaveSignature(req, res) {
   try {
     const { licenceId, opticienId, signature } = req.body || {};
-    if (typeof signature !== 'string') return res.status(400).json({ success: false, error: 'SIGNATURE_MANQUANTE' });
+    if (typeof signature !== 'string') return res.status(400).json({ success:false, error:'SIGNATURE_MANQUANTE' });
 
     const clean = String(signature).trim().slice(0, 200);
-
     const result = await updateLicenceFields({
       licenceId,
       opticienId,
       patch: { signature: clean },
-      allowKeys: ['signature'] // ⬅️ autorise l'écrasement durable
+      allowKeys: ['signature']
     });
+    if (!result.ok) return res.status(result.status || 500).json({ success:false, error: result.error });
 
-    if (!result.ok) return res.status(result.status || 500).json({ success: false, error: result.error });
-    return res.json({ success: true, licence: result.licence });
+    return res.json({ success:true, licence: result.licence });
   } catch (e) {
     console.error('❌ /licence/signature error:', e);
-    res.status(500).json({ success: false, error: 'SERVER_ERROR' });
+    return res.status(500).json({ success:false, error:'SERVER_ERROR' });
   }
-});
+}
+
+// Monter les routes (POST + PUT) avec et sans /api
+app.post('/licence/expediteur', handleSaveSender);
+app.put ('/licence/expediteur', handleSaveSender);
+app.post('/api/licence/expediteur', handleSaveSender);
+app.put ('/api/licence/expediteur', handleSaveSender);
+
+app.post('/licence/signature', handleSaveSignature);
+app.put ('/licence/signature', handleSaveSignature);
+app.post('/api/licence/signature', handleSaveSignature);
+app.put ('/api/licence/signature', handleSaveSignature);
+
+// (optionnel) préflights explicites
+app.options(['/licence/expediteur','/api/licence/expediteur',
+             '/licence/signature','/api/licence/signature'], (req,res)=>res.sendStatus(204));
 
 
 
-
-// =======================
-//   Licence: signature SMS
-// =======================
-app.post('/licence/signature', async (req, res) => {
-  try {
-    const { licenceId, opticienId, signature } = req.body || {};
-    if (typeof signature !== 'string') return res.status(400).json({ success: false, error: 'SIGNATURE_MANQUANTE' });
-
-    const clean = String(signature).trim().slice(0, 200);
-
-    const result = await updateLicenceFields({
-      licenceId,
-      opticienId,
-      patch: { signature: clean }
-    });
-
-    if (!result.ok) return res.status(result.status || 500).json({ success: false, error: result.error });
-    return res.json({ success: true, licence: result.licence });
-  } catch (e) {
-    console.error('❌ /licence/signature error:', e);
-    res.status(500).json({ success: false, error: 'SERVER_ERROR' });
-  }
-});
 
 // =======================
 //   CGV status / accept
@@ -854,11 +849,6 @@ const crypto = require('crypto');
 const lastSent = new Map();
 const MIN_INTERVAL_MS = 15 * 1000;
 
-function sanitizeCategorie(raw) {
-  const s = String(raw || '').trim();
-  return s ? s.slice(0, 32) : 'autre'; // max 32 chars, défaut "autre"
-}
-
 function ymKey(d = new Date()) { return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`; }
 function sha256Hex(s) { return crypto.createHash('sha256').update(String(s)).digest('hex'); }
 function normalizeFR(msisdn='') { return toFRNumber(msisdn).replace(/\D/g,''); }
@@ -972,22 +962,6 @@ app.post(
     }
   }
 );
-
-
-// Variante "un numéro" conviviale
-app.post(
-  ['/api/sms-history/erase-for-number', '/licence/history/erase-for-number'],
-  async (req, res) => {
-    req.body = { ...req.body, all: false }; // force le mode numéro
-    // On réutilise la route précédente pour éviter le code dupliqué
-    return app._router.handle(
-      Object.assign(req, { url: '/api/sms-history/erase', method: 'POST' }),
-      res,
-      () => {}
-    );
-  }
-);
-
 
 // --- Opt-out
 app.get('/unsubscribe', async (req, res) => {
@@ -1110,10 +1084,6 @@ function sanitizeCategorie(raw) {
   return s ? s.slice(0, 32) : 'autre'; // ex: "lunettes", "lentilles", "sav", "noel", "été"
 }
 
-// (si tu n'as pas déjà ce helper global ailleurs)
-function ensureStopMention(text) {
-  return /stop\s+au\s+36111/i.test(text) ? text : `${text}\nSTOP au 36111`;
-}
 
 // ============================
 //   Envoi SMS (avec catégorie)
