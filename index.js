@@ -320,39 +320,49 @@ function findLicenceIndexByAnyId(list, licenceId) {
 }
 
 // --- Serialize JSONBin writes & always merge on latest snapshot ---
+// ⚠️ Nouveau: mutation sur un CLONE, cache mis à jour uniquement si PUT OK
 let __jsonbinWriteChain = Promise.resolve();
 
 /**
- * Exécute mutator sur l’état le plus récent (force=true),
- * sérialise les écritures et fait un PUT unique.
- * Le mutator DOIT muter `list` in-place (ex: list.push(item)).
- * Retourne la valeur de mutator. Pour annuler la sauvegarde, retourner { __skipSave: true }.
+ * Exécute mutator sur un clone du dernier état (force=true), sérialise les écritures,
+ * et fait un PUT unique. Le mutator DOIT muter `draft.list` in-place.
+ * Retourne la valeur du mutator. Pour annuler la sauvegarde, retourne { __skipSave: true }.
  */
 async function withJsonbinUpdate(mutator) {
   let out;
   __jsonbinWriteChain = __jsonbinWriteChain.then(async () => {
-    // Récupère toujours le snapshot le plus frais
-    const state = await jsonbinGetAll(true); // { list, rawRecord }
-    // Laisse le mutator modifier list IN-PLACE
-    out = (await mutator(state)) || {};
+    // 1) Récupère l'état le + récent (bypass cache)
+    const latest = await jsonbinGetAll(true);
+
+    // 2) Clone profond pour éviter de muter le cache tant que le PUT n'est pas OK
+    const draft = {
+      rawRecord: Array.isArray(latest.rawRecord)
+        ? latest.rawRecord.map(x => JSON.parse(JSON.stringify(x)))
+        : JSON.parse(JSON.stringify(latest.rawRecord)),
+      list: latest.list.map(x => JSON.parse(JSON.stringify(x))),
+    };
+
+    // 3) Mutation côté appelant
+    out = (await mutator(draft)) || {};
     if (out.__skipSave) return;
 
-    // ⚠️ IMPORTANT : on écrit TOUJOURS un TABLEAU dans le BIN
-    // (si le BIN était un objet, on le "convertit" en tableau – plus sûr pour accumuler des licences)
-    await jsonbinPutAll(Array.isArray(state.list) ? state.list : []);
+    // 4) Calcule la forme à persister selon le schéma du bin (array vs objet)
+    const toPut = Array.isArray(latest.rawRecord) ? draft.list : (draft.list[0] || {});
+
+    // 5) Sauvegarde sur JSONBin
+    await jsonbinPutAll(toPut);
+
+    // 6) Si OK, le cache global est déjà mis à jour par jsonbinPutAll().
+    // Rien d'autre à faire ici.
   }).catch((e) => {
     console.error('withJsonbinUpdate failed:', e);
     throw e;
   });
-  console.log('✅ JSONBin sauvegardé:', {
-  bin: process.env.JSONBIN_BIN_ID,
-  count: Array.isArray(state.list) ? state.list.length : 0
-});
-
 
   await __jsonbinWriteChain;
   return out;
 }
+
 
 
 
