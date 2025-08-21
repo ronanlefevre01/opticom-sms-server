@@ -41,7 +41,6 @@ const fetch = globalThis.fetch.bind(globalThis);
 
 const app = express();
 
-
 // --- Metrics ultra-simples
 const metrics = { byPath: new Map() };
 app.use((req, _res, next) => {
@@ -137,7 +136,6 @@ const corsOptions = {
 app.use((req, res, next) => { res.setHeader('Vary', 'Origin'); next(); });
 app.use(cors(corsOptions));
 app.options(/.*/, cors(corsOptions)); // préflights
-
 
 // --- Cookies
 app.use(cookieParser());
@@ -330,11 +328,8 @@ async function withJsonbinUpdate(mutator) {
   return out;
 }
 
-
 // (facultatif) expose les métriques si tu veux les lire depuis une route /__metrics
 module.exports.__JSONBIN_METRICS__ = __METRICS__;
-
-
 
 function mergeWithProtection(oldObj = {}, patch = {}, allowKeys = []) {
   const allow = new Set(allowKeys);
@@ -399,22 +394,22 @@ function normalizeSenderUpper(raw = '') {
   return s;
 }
 
-function findLicenceIdxByRefs(list, { licenceId, cle, opticienId }) {
-  const byId = (l) => licenceId && String(l.id) === String(licenceId);
-  const byCle = (l) => cle && String(l.licence || l.cle || l.key) === String(cle);
-  const byOpt = (l) => opticienId && String(l.opticien?.id) === String(opticienId);
+function normKey(s=''){ return String(s).replace(/[\s-]/g,'').toUpperCase(); }
 
-  let idx = list.findIndex((l) => byId(l) || byCle(l) || byOpt(l));
+function findLicenceIdxByRefs(list, { licenceId, cle, opticienId }) {
+  const byId  = l => licenceId  && String(l.id) === String(licenceId);
+  const byCle = l => cle && normKey(l.licence || l.cle || l.key) === normKey(cle);
+  const byOpt = l => opticienId && String(l.opticien?.id) === String(opticienId);
+
+  let idx = list.findIndex(l => byId(l) || byCle(l) || byOpt(l));
   if (idx >= 0) return { idx, licence: list[idx] };
 
-  // fallback : si l’appelant nous passe seulement `id` mais c’est en fait la cle
-  if (licenceId && !cle) {
-    idx = list.findIndex((l) => String(l.licence || l.cle || l.key) === String(licenceId));
+  if (licenceId && !cle) { // fallback si "licenceId" contient en fait la clé
+    idx = list.findIndex(l => normKey(l.licence || l.cle || l.key) === normKey(licenceId));
     if (idx >= 0) return { idx, licence: list[idx] };
   }
   return { idx: -1, licence: null };
 }
-
 
 // =======================
 //   Licence: expéditeur & signature (POST+PUT, avec alias /api)
@@ -513,7 +508,43 @@ app.put ('/licence/signature', handleSaveSignature);
 app.post('/api/licence/signature', handleSaveSignature);
 app.put ('/api/licence/signature', handleSaveSignature);
 
+// ✅ Bootstrap expéditeur + signature en une fois
+app.post('/api/licence/bootstrap', async (req, res) => {
+  try {
+    const { licenceId, libelleExpediteur, signature } = req.body || {};
+    if (!licenceId) return res.status(400).json({ ok:false, error:'LICENCE_ID_REQUIS' });
 
+    const cleanedSender = libelleExpediteur ? normalizeSenderUpper(libelleExpediteur) : null;
+    const cleanedSignature = typeof signature === 'string' ? signature.trim().slice(0, 200) : null;
+
+    const result = await withJsonbinUpdate(async ({ list }) => {
+      const { idx, licence } = findLicenceIndex(list, l => String(l.id) === String(licenceId));
+      if (idx === -1 || !licence) return { __skipSave: true, status: 404 };
+
+      let changed = false;
+      if (cleanedSender && cleanedSender.length >= 3) {
+        licence.libelleExpediteur = cleanedSender;
+        licence.expediteur = cleanedSender; // compat ancien schéma
+        changed = true;
+      }
+      if (typeof cleanedSignature === 'string') {
+        licence.signature = cleanedSignature;
+        changed = true;
+      }
+      if (!changed) return { __skipSave: true };
+
+      licence.updatedAt = new Date().toISOString();
+      list[idx] = licence;
+      return { licence };
+    });
+
+    if (result?.status === 404) return res.status(404).json({ ok:false, error:'LICENCE_INTROUVABLE' });
+    return res.json({ ok:true });
+  } catch (e) {
+    console.error('❌ /api/licence/bootstrap', e);
+    return res.status(500).json({ ok:false, error:'SERVER_ERROR' });
+  }
+});
 
 // =======================
 //   CGV status / accept
@@ -659,14 +690,16 @@ async function applySenderAndSignature(req, res, next) {
   }
 }
 
-
 // ===============================
 //   GoCardless: mandat & licence
 // ===============================
 app.post('/create-mandat', async (req, res) => {
   const {
     nomMagasin, email, adresse, ville, codePostal, pays,
-    formuleId, siret, telephone
+    formuleId, siret, telephone,
+    // 👇 ajoutés : saisis sur LicenceCheckPage
+    libelleExpediteur: libelleFromClient,
+    signature: signatureFromClient
   } = req.body;
 
   const enseigne = (nomMagasin || req.body.enseigne || req.body.nom || '').trim();
@@ -683,7 +716,7 @@ app.post('/create-mandat', async (req, res) => {
       address_line1: adresse,
       city: ville,
       postal_code: codePostal,
-      country_code: pays || 'FR'
+      country_code: (pays || 'FR')
     };
 
     const response = await fetch(`${GO_CARDLESS_API_BASE}/redirect_flows`, {
@@ -710,8 +743,11 @@ app.post('/create-mandat', async (req, res) => {
       return res.status(500).json({ error: 'Erreur GoCardless. Vérifiez vos informations.' });
     }
 
+    // ✅ on mémorise aussi expéditeur + signature pour l’étape /validation-mandat
     sessionTokenMap.set(session_token, {
-      enseigne, email, adresse, ville, codePostal, pays, formuleId, siret, telephone
+      enseigne, email, adresse, ville, codePostal, pays, formuleId, siret, telephone,
+      libelleFromClient: libelleFromClient || '', // brut
+      signatureFromClient: typeof signatureFromClient === 'string' ? signatureFromClient : ''
     });
 
     res.status(200).json({ url: data.redirect_flows.redirect_url });
@@ -727,13 +763,6 @@ app.get('/validation-mandat', async (req, res) => {
   if (!redirectFlowId || !sessionToken) {
     return res.status(400).send('Paramètre manquant ou session expirée.');
   }
-
-  const normalizeSenderUpper = (raw = 'OptiCOM') => {
-    let s = String(raw).toUpperCase().replace(/[^A-Z0-9]/g, '');
-    if (s.length < 3) s = 'OPTICOM';
-    if (s.length > 11) s = s.slice(0, 11);
-    return s;
-  };
 
   try {
     const confirmResponse = await goCardlessClient.redirectFlows.complete(
@@ -760,7 +789,16 @@ app.get('/validation-mandat', async (req, res) => {
     const credits    = selectedFormule.credits;
 
     const licenceKey = uuidv4();
-    const libelleExpediteur = normalizeSenderUpper(enseigne);
+
+    // ✅ on honore la saisie client, sinon fallback sur l’enseigne normalisée
+    const libelleExpediteur =
+      (opt.libelleFromClient && normalizeSenderUpper(opt.libelleFromClient)) ||
+      normalizeSenderUpper(enseigne);
+
+    const signatureClean =
+      typeof opt.signatureFromClient === 'string'
+        ? opt.signatureFromClient.trim().slice(0, 200)
+        : '';
 
     const newLicence = {
       id: uuidv4(),
@@ -769,6 +807,7 @@ app.get('/validation-mandat', async (req, res) => {
       abonnement,
       credits,
       libelleExpediteur,
+      signature: signatureClean,
       opticien: {
         id: 'opt-' + Math.random().toString(36).slice(2, 10),
         enseigne,
@@ -785,25 +824,10 @@ app.get('/validation-mandat', async (req, res) => {
       customerId
     };
 
-    const binId = must(JSONBIN_BIN_ID, 'JSONBIN_BIN_ID');
-    const apiKey = must(JSONBIN_KEY, 'JSONBIN_KEY');
-
-    const getResponse = await axios.get(`https://api.jsonbin.io/v3/b/${binId}/latest`, {
-      headers: { 'X-Master-Key': apiKey, 'X-Bin-Meta': 'false' }
-    });
-
-    const record = getResponse.data?.record ?? getResponse.data;
-    const list   = Array.isArray(record) ? record : (record ? [record] : []);
-    list.push(newLicence);
-
-    const bodyToPut = Array.isArray(record) ? list : newLicence;
-
-    await axios.put(`https://api.jsonbin.io/v3/b/${binId}`, bodyToPut, {
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Master-Key': apiKey,
-        'X-Bin-Versioning': 'false'
-      }
+    // ✅ Sauvegarde JSONBin via helper (gère cache et schéma array/single)
+    await withJsonbinUpdate(async ({ list }) => {
+      list.push(newLicence);
+      return {};
     });
 
     sessionTokenMap.delete(sessionToken);
@@ -1134,7 +1158,6 @@ function sanitizeCategorie(raw) {
   return s ? s.slice(0, 32) : 'autre'; // ex: "lunettes", "lentilles", "sav", "noel", "été"
 }
 
-
 // ============================
 //   Envoi SMS (avec catégorie)
 // ============================
@@ -1409,8 +1432,6 @@ app.post('/api/sms/history/clear', async (req, res) => {
     res.status(500).json({ ok:false, error:'SERVER_ERROR' });
   }
 });
-
-
 
 // =======================
 //   SUPPORT / FEEDBACK
@@ -1824,7 +1845,7 @@ app.post('/webhook-stripe', express.raw({ type: 'application/json' }), async (re
   if (event.type === 'checkout.session.completed') {
     const session = event.data.object;
     const email = session.metadata?.email;
-       const quantity = parseInt(session.metadata?.quantity || '1');
+    const quantity = parseInt(session.metadata?.quantity || '1');
     if (email) {
       try {
         const { list, rawRecord } = await jsonbinGetAll();
@@ -1882,8 +1903,6 @@ app.post('/webhook-stripe', express.raw({ type: 'application/json' }), async (re
 // =======================
 //   Licences - API
 // =======================
-function normKey(s = '') { return String(s).replace(/[\s-]/g, '').toUpperCase(); }
-
 async function findLicence({ cle, id }) {
   const { list } = await jsonbinGetAll();
   if (id) {
@@ -1930,7 +1949,6 @@ app.get(
   }
 );
 
-
 app.get('/api/licences', async (_req, res) => {
   try {
     const { list } = await jsonbinGetAll();
@@ -1952,8 +1970,6 @@ app.get('/api/licences', async (_req, res) => {
   }
 });
 
-
-// Le client envoie un patch partiel { ... } — les PROTECTED_FIELDS sont conservés
 // Le client envoie un patch partiel { ... } — les PROTECTED_FIELDS sont conservés
 app.post('/api/licence/sync-safe', async (req, res) => {
   try {
@@ -2000,9 +2016,6 @@ app.post('/api/licence/sync-safe', async (req, res) => {
     res.status(500).json({ ok:false, error:'SERVER_ERROR' });
   }
 });
-
-
-
 
 // =======================
 //   Préférences auto
@@ -2171,8 +2184,7 @@ app.post('/api/clients/upsert', async (req, res) => {
       }
 
       const merged = Array.from(exists.values()).slice(-50000);
-      list[idx].clients = merged;                     // ✅ on ne touche qu’aux clients
-      list[idx].updatedAt = new Date().toISOString(); // (signature/libellé/historique conservés)
+      list[idx] = { ...list[idx], clients: merged, updatedAt: new Date().toISOString() }; // ✅ on ne touche qu’aux clients
       return { changed, total: merged.length };
     });
 
@@ -2183,7 +2195,6 @@ app.post('/api/clients/upsert', async (req, res) => {
     res.status(500).json({ error: 'SERVER_ERROR' });
   }
 });
-
 
 app.delete('/api/clients/:id', async (req, res) => {
   try {
@@ -2215,8 +2226,6 @@ app.delete('/api/clients/:id', async (req, res) => {
     res.status(500).json({ error: 'SERVER_ERROR' });
   }
 });
-
-
 
 // =======================
 //   CRON formules / résiliation
