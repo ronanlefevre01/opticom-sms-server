@@ -392,6 +392,29 @@ async function updateLicenceFields({ licenceId, opticienId, patch = {}, allowKey
   return { ok:true, licence: updated };
 }
 
+function normalizeSenderUpper(raw = '') {
+  let s = String(raw).toUpperCase().replace(/[^A-Z0-9]/g, '');
+  if (s.length < 3) s = 'OPTICOM';
+  if (s.length > 11) s = s.slice(0, 11);
+  return s;
+}
+
+function findLicenceIdxByRefs(list, { licenceId, cle, opticienId }) {
+  const byId = (l) => licenceId && String(l.id) === String(licenceId);
+  const byCle = (l) => cle && String(l.licence || l.cle || l.key) === String(cle);
+  const byOpt = (l) => opticienId && String(l.opticien?.id) === String(opticienId);
+
+  let idx = list.findIndex((l) => byId(l) || byCle(l) || byOpt(l));
+  if (idx >= 0) return { idx, licence: list[idx] };
+
+  // fallback : si l’appelant nous passe seulement `id` mais c’est en fait la cle
+  if (licenceId && !cle) {
+    idx = list.findIndex((l) => String(l.licence || l.cle || l.key) === String(licenceId));
+    if (idx >= 0) return { idx, licence: list[idx] };
+  }
+  return { idx: -1, licence: null };
+}
+
 
 // =======================
 //   Licence: expéditeur & signature (POST+PUT, avec alias /api)
@@ -416,71 +439,80 @@ async function resolveLicenceIdFromAny(b, q) {
 async function handleSaveSender(req, res) {
   try {
     const b = req.body || {}, q = req.query || {};
-    const libelleExpediteur = pickStr(b.libelleExpediteur, b.sender, b.expediteur, q.libelleExpediteur);
-    if (!libelleExpediteur) return res.status(400).json({ success:false, error:'LIBELLE_MANQUANT' });
+    const libelleInput = String(b.libelleExpediteur ?? b.sender ?? b.expediteur ?? q.libelleExpediteur ?? '').trim();
+    if (!libelleInput) return res.status(400).json({ success: false, error: 'LIBELLE_MANQUANT' });
 
-    const cleaned = libelleExpediteur.replace(/[^a-zA-Z0-9]/g, '').slice(0, 11);
-    if (cleaned.length < 3) return res.status(400).json({ success:false, error:'LIBELLE_INVALIDE' });
+    const refs = {
+      licenceId: String(b.licenceId ?? q.licenceId ?? b.id ?? '').trim() || undefined,
+      cle:       String(b.cle ?? q.cle ?? b.licence ?? '').trim() || undefined,
+      opticienId:String(b.opticienId ?? q.opticienId ?? '').trim() || undefined,
+    };
 
-    const opticienId = pickStr(b.opticienId, q.opticienId);
-    let licenceId = pickStr(b.licenceId, q.licenceId, b.id);
-    if (!licenceId) licenceId = await resolveLicenceIdFromAny(b, q);
+    const cleaned = normalizeSenderUpper(libelleInput);
 
-    const result = await updateLicenceFields({
-      licenceId, opticienId,
-      patch: { libelleExpediteur: cleaned },
-      allowKeys: ['libelleExpediteur']
+    const result = await withJsonbinUpdate(async ({ list }) => {
+      const { idx, licence } = findLicenceIdxByRefs(list, refs);
+      if (idx === -1 || !licence) return { __skipSave: true, status: 404, error: 'LICENCE_NOT_FOUND' };
+
+      licence.libelleExpediteur = cleaned;
+      // compat ancien schéma
+      licence.expediteur = cleaned;
+      licence.updatedAt = new Date().toISOString();
+
+      list[idx] = licence; // mutation in-place
+      return { licence };
     });
-    if (!result.ok) return res.status(result.status || 500).json({ success:false, error: result.error });
 
-    return res.json({ success:true, licence: result.licence });
+    if (result?.status === 404) return res.status(404).json({ success: false, error: 'LICENCE_NOT_FOUND' });
+    return res.json({ success: true, licence: result.licence });
   } catch (e) {
     console.error('❌ /licence/expediteur error:', e);
-    return res.status(500).json({ success:false, error:'SERVER_ERROR' });
+    return res.status(500).json({ success: false, error: 'SERVER_ERROR' });
   }
 }
 
 async function handleSaveSignature(req, res) {
   try {
     const b = req.body || {}, q = req.query || {};
-    const signature = pickStr(b.signature, q.signature);
-    if (!signature) return res.status(400).json({ success:false, error:'SIGNATURE_MANQUANTE' });
+    const signature = String(b.signature ?? q.signature ?? '').trim().slice(0, 200);
+    if (!signature) return res.status(400).json({ success: false, error: 'SIGNATURE_MANQUANTE' });
 
-    const opticienId = pickStr(b.opticienId, q.opticienId);
-    let licenceId = pickStr(b.licenceId, q.licenceId, b.id);
-    if (!licenceId) licenceId = await resolveLicenceIdFromAny(b, q);
+    const refs = {
+      licenceId: String(b.licenceId ?? q.licenceId ?? b.id ?? '').trim() || undefined,
+      cle:       String(b.cle ?? q.cle ?? b.licence ?? '').trim() || undefined,
+      opticienId:String(b.opticienId ?? q.opticienId ?? '').trim() || undefined,
+    };
 
-    const clean = signature.slice(0, 200);
-    const result = await updateLicenceFields({
-      licenceId, opticienId,
-      patch: { signature: clean },
-      allowKeys: ['signature']
+    const result = await withJsonbinUpdate(async ({ list }) => {
+      const { idx, licence } = findLicenceIdxByRefs(list, refs);
+      if (idx === -1 || !licence) return { __skipSave: true, status: 404, error: 'LICENCE_NOT_FOUND' };
+
+      licence.signature = signature;
+      licence.updatedAt = new Date().toISOString();
+
+      list[idx] = licence; // mutation in-place
+      return { licence };
     });
-    if (!result.ok) return res.status(result.status || 500).json({ success:false, error: result.error });
 
-    return res.json({ success:true, licence: result.licence });
+    if (result?.status === 404) return res.status(404).json({ success: false, error: 'LICENCE_NOT_FOUND' });
+    return res.json({ success: true, licence: result.licence });
   } catch (e) {
     console.error('❌ /licence/signature error:', e);
-    return res.status(500).json({ success:false, error:'SERVER_ERROR' });
+    return res.status(500).json({ success: false, error: 'SERVER_ERROR' });
   }
 }
-
-// Monter toutes les variantes (POST/PUT + /api)
+// Sender
 app.post('/licence/expediteur', handleSaveSender);
 app.put ('/licence/expediteur', handleSaveSender);
 app.post('/api/licence/expediteur', handleSaveSender);
 app.put ('/api/licence/expediteur', handleSaveSender);
 
+// Signature
 app.post('/licence/signature', handleSaveSignature);
 app.put ('/licence/signature', handleSaveSignature);
 app.post('/api/licence/signature', handleSaveSignature);
 app.put ('/api/licence/signature', handleSaveSignature);
 
-// Préflights explicites (facultatif)
-app.options([
-  '/licence/expediteur','/api/licence/expediteur',
-  '/licence/signature','/api/licence/signature'
-], (req,res)=>res.sendStatus(204));
 
 
 // =======================
