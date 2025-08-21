@@ -393,27 +393,41 @@ async function updateLicenceFields({ licenceId, opticienId, patch = {}, allowKey
 }
 
 
-
-
 // =======================
-//   Licence: expéditeur
+//   Licence: expéditeur & signature (POST+PUT, avec alias /api)
+//   -> tolère plusieurs noms de champs et récupère licenceId de plusieurs façons
 // =======================
-// Libellé expéditeur – écrase la valeur JSONBin (autorisé)
-// =======================
-//   Licence: expéditeur & signature
-// =======================
+function pickStr(...vals) {
+  for (const v of vals) {
+    if (typeof v === 'string' && v.trim()) return v.trim();
+  }
+  return '';
+}
+async function resolveLicenceIdFromAny(b, q) {
+  // Priorité: id direct, sinon cle/licence -> recherche
+  const direct = pickStr(b.licenceId, q.licenceId, b.id);
+  if (direct) return direct;
+  const key = pickStr(b.cle, q.cle, b.key, b.licence);
+  if (!key) return '';
+  const lic = await findLicence({ cle: key }); // ta fonction existante plus bas
+  return lic?.id || '';
+}
 
 async function handleSaveSender(req, res) {
   try {
-    const { licenceId, opticienId, libelleExpediteur } = req.body || {};
+    const b = req.body || {}, q = req.query || {};
+    const libelleExpediteur = pickStr(b.libelleExpediteur, b.sender, b.expediteur, q.libelleExpediteur);
     if (!libelleExpediteur) return res.status(400).json({ success:false, error:'LIBELLE_MANQUANT' });
 
-    const cleaned = String(libelleExpediteur).replace(/[^a-zA-Z0-9]/g, '').slice(0, 11);
+    const cleaned = libelleExpediteur.replace(/[^a-zA-Z0-9]/g, '').slice(0, 11);
     if (cleaned.length < 3) return res.status(400).json({ success:false, error:'LIBELLE_INVALIDE' });
 
+    const opticienId = pickStr(b.opticienId, q.opticienId);
+    let licenceId = pickStr(b.licenceId, q.licenceId, b.id);
+    if (!licenceId) licenceId = await resolveLicenceIdFromAny(b, q);
+
     const result = await updateLicenceFields({
-      licenceId,
-      opticienId,
+      licenceId, opticienId,
       patch: { libelleExpediteur: cleaned },
       allowKeys: ['libelleExpediteur']
     });
@@ -428,13 +442,17 @@ async function handleSaveSender(req, res) {
 
 async function handleSaveSignature(req, res) {
   try {
-    const { licenceId, opticienId, signature } = req.body || {};
-    if (typeof signature !== 'string') return res.status(400).json({ success:false, error:'SIGNATURE_MANQUANTE' });
+    const b = req.body || {}, q = req.query || {};
+    const signature = pickStr(b.signature, q.signature);
+    if (!signature) return res.status(400).json({ success:false, error:'SIGNATURE_MANQUANTE' });
 
-    const clean = String(signature).trim().slice(0, 200);
+    const opticienId = pickStr(b.opticienId, q.opticienId);
+    let licenceId = pickStr(b.licenceId, q.licenceId, b.id);
+    if (!licenceId) licenceId = await resolveLicenceIdFromAny(b, q);
+
+    const clean = signature.slice(0, 200);
     const result = await updateLicenceFields({
-      licenceId,
-      opticienId,
+      licenceId, opticienId,
       patch: { signature: clean },
       allowKeys: ['signature']
     });
@@ -447,7 +465,7 @@ async function handleSaveSignature(req, res) {
   }
 }
 
-// Monter les routes (POST + PUT) avec et sans /api
+// Monter toutes les variantes (POST/PUT + /api)
 app.post('/licence/expediteur', handleSaveSender);
 app.put ('/licence/expediteur', handleSaveSender);
 app.post('/api/licence/expediteur', handleSaveSender);
@@ -458,11 +476,11 @@ app.put ('/licence/signature', handleSaveSignature);
 app.post('/api/licence/signature', handleSaveSignature);
 app.put ('/api/licence/signature', handleSaveSignature);
 
-// (optionnel) préflights explicites
-app.options(['/licence/expediteur','/api/licence/expediteur',
-             '/licence/signature','/api/licence/signature'], (req,res)=>res.sendStatus(204));
-
-
+// Préflights explicites (facultatif)
+app.options([
+  '/licence/expediteur','/api/licence/expediteur',
+  '/licence/signature','/api/licence/signature'
+], (req,res)=>res.sendStatus(204));
 
 
 // =======================
