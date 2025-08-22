@@ -13,6 +13,10 @@ const cookieParser = require('cookie-parser');
 const { URLSearchParams } = require('url');
 const multer = require('multer');
 const cryptoNode = require('crypto');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const JWT_SECRET = process.env.JWT_SECRET || 'change-me-super-secret';
+
 
 // --- Routes/Services externes existants
 const licenceRoutes = require('./routes/licence.routes');
@@ -380,6 +384,22 @@ function mergeWithProtection(oldObj = {}, patch = {}, allowKeys = []) {
   out.updatedAt = new Date().toISOString();
   return out;
 }
+
+function signToken(payload, expiresIn = '30d') {
+  return jwt.sign(payload, JWT_SECRET, { algorithm: 'HS256', expiresIn });
+}
+function verifyToken(token) {
+  try { return jwt.verify(token, JWT_SECRET); } catch { return null; }
+}
+async function getLicenceByIdOrKey({ licenceId, cle }) {
+  const { list } = await jsonbinGetAll();
+  const { idx, licence } = findLicenceIndex(list, l =>
+    (licenceId && String(l.id) === String(licenceId)) ||
+    (cle && normKey(l.licence || l.cle || l.key) === normKey(cle))
+  );
+  return { idx, licence, list };
+}
+
 
 // =======================
 //   Licence update helper
@@ -923,9 +943,10 @@ try {
     const APP_URL = (process.env.PUBLIC_APP_URL || process.env.PUBLIC_WEB_APP_URL || '').trim();
 const appBase = APP_URL.replace(/\/+$/, '');
 
-// 🔁 cible explicitement l'écran LicencePage
-const webDeeplink   = appBase ? `${appBase}/LicencePage?licence=${encodeURIComponent(licenceKey)}` : '';
-const schemeDeeplink = `opticom://LicencePage?licence=${encodeURIComponent(licenceKey)}`;
+// 🔁 redirige SANS clé vers LicenceCheckPage (web ou schéma natif)
+const webDeeplink    = appBase ? `${appBase}/LicenceCheckPage` : '';
+const schemeDeeplink = `opticom://LicenceCheckPage`;
+
 
     res.send(`
       <html>
@@ -957,7 +978,7 @@ const schemeDeeplink = `opticom://LicencePage?licence=${encodeURIComponent(licen
               <button class="btn btn-copy" onclick="copyLicence()">📋 Copier</button>
             </div>
 
-            <p class="small" id="autoMsg">La clé a été copiée. Redirection automatique dans <span id="sec">5</span>&nbsp;s…</p>
+            <p class="small" id="autoMsg">La clé a été copiée. Redirection automatique dans <span id="sec">10</span>&nbsp;s…</p>
 
             <a id="returnBtn" class="btn btn-return" href="${webDeeplink || schemeDeeplink}">
               ↩️ Retourner dans l’application
@@ -1787,6 +1808,147 @@ app.patch('/api/admin/feedback/:id', requireAdminToken, async (req, res) => {
 
 // Petit ping JSON brut
 app.get('/api/ping', (_req, res) => res.json({ ok: true }));
+
+
+// =======================
+//   ADMIN : Auth licences (email & mot de passe)
+// =======================
+
+// POST /api/auth/set-password  { licenceId|cle, email, password }
+app.post('/api/auth/set-password', burstLimiter, async (req, res) => {
+  try {
+    const { licenceId, cle, email, password } = req.body || {};
+    if ((!licenceId && !cle) || !email || !password) {
+      return res.status(400).json({ ok:false, error:'PARAMS' });
+    }
+    if (String(password).length < 8) {
+      return res.status(400).json({ ok:false, error:'PASSWORD_TOO_SHORT' });
+    }
+
+    const { idx, licence, list } = await getLicenceByIdOrKey({ licenceId, cle });
+    if (idx === -1 || !licence) return res.status(404).json({ ok:false, error:'LICENCE_NOT_FOUND' });
+
+    // Empêche d’écraser un mot de passe déjà défini (sauf si tu veux autoriser du reset)
+    if (licence.auth?.passHash) {
+      return res.status(409).json({ ok:false, error:'PASSWORD_ALREADY_SET' });
+    }
+
+    const passHash = await bcrypt.hash(String(password), 10);
+    const auth = {
+      email: String(email).toLowerCase().trim(),
+      passHash,
+      passwordSetAt: new Date().toISOString(),
+    };
+    licence.auth = auth;
+
+    const { rawRecord } = await jsonbinGetAll();
+    await jsonbinPutAll(Array.isArray(rawRecord) ? (list[idx]=licence, list) : licence);
+
+    const token = signToken({ licenceId: licence.id, email: auth.email });
+    res.json({ ok:true, token, licence: { ...licence, auth:{ email: auth.email, passwordSetAt: auth.passwordSetAt } } });
+  } catch (e) {
+    console.error('set-password error', e);
+    res.status(500).json({ ok:false, error:'SERVER_ERROR' });
+  }
+});
+
+// POST /api/auth/login  { licenceId|cle, email, password }
+app.post('/api/auth/login', burstLimiter, async (req, res) => {
+  try {
+    const { licenceId, cle, email, password } = req.body || {};
+    if ((!licenceId && !cle) || !email || !password) {
+      return res.status(400).json({ ok:false, error:'PARAMS' });
+    }
+    const { licence } = await getLicenceByIdOrKey({ licenceId, cle });
+    if (!licence || !licence.auth?.passHash) {
+      return res.status(404).json({ ok:false, error:'AUTH_NOT_INITIALIZED' });
+    }
+    const okEmail = String(licence.auth.email||'').toLowerCase() === String(email||'').toLowerCase();
+    const okPass  = await bcrypt.compare(String(password), String(licence.auth.passHash));
+    if (!okEmail || !okPass) return res.status(401).json({ ok:false, error:'BAD_CREDENTIALS' });
+
+    const token = signToken({ licenceId: licence.id, email: licence.auth.email });
+    res.json({ ok:true, token, licence });
+  } catch (e) {
+    console.error('login error', e);
+    res.status(500).json({ ok:false, error:'SERVER_ERROR' });
+  }
+});
+
+// GET /api/auth/me   (Authorization: Bearer <token>)
+app.get('/api/auth/me', burstLimiter, async (req, res) => {
+  try {
+    const auth = (req.get('authorization')||'').split(' ')[1] || '';
+    const decoded = verifyToken(auth);
+    if (!decoded?.licenceId) return res.status(401).json({ ok:false, error:'INVALID_TOKEN' });
+
+    const { list } = await jsonbinGetAll();
+    const { idx, licence } = findLicenceIndex(list, l => String(l.id) === String(decoded.licenceId));
+    if (idx === -1 || !licence) return res.status(404).json({ ok:false, error:'LICENCE_NOT_FOUND' });
+
+    res.json({ ok:true, licence });
+  } catch (e) {
+    console.error('me error', e);
+    res.status(401).json({ ok:false, error:'INVALID_TOKEN' });
+  }
+});
+
+// === à placer juste sous tes routes /api/auth/set-password|login|me ===
+
+// GET /auth/has-account?licenceId=... | &cle=...
+app.get(['/auth/has-account','/api/auth/has-account'], burstLimiter, async (req, res) => {
+  try {
+    const { licenceId, cle } = req.query || {};
+    const { licence } = await getLicenceByIdOrKey({ licenceId, cle });
+    if (!licence) return res.json({ accountExists: false });
+    return res.json({ accountExists: !!(licence.auth && licence.auth.passHash), email: licence.auth?.email || null });
+  } catch (e) {
+    console.error('has-account error', e);
+    return res.json({ accountExists: false });
+  }
+});
+
+// POST /auth/register  { licenceId|cle, email, password }
+app.post(['/auth/register','/api/auth/register'], burstLimiter, async (req, res) => {
+  try {
+    const { licenceId, cle, email, password } = req.body || {};
+    if ((!licenceId && !cle) || !email || !password) {
+      return res.status(400).json({ ok:false, error:'PARAMS' });
+    }
+    if (String(password).length < 8) {
+      return res.status(400).json({ ok:false, error:'PASSWORD_TOO_SHORT' });
+    }
+
+    const { idx, licence, list } = await getLicenceByIdOrKey({ licenceId, cle });
+    if (idx === -1 || !licence) return res.status(404).json({ ok:false, error:'LICENCE_NOT_FOUND' });
+    if (licence.auth?.passHash) {
+      return res.status(409).json({ ok:false, error:'PASSWORD_ALREADY_SET' });
+    }
+
+    const passHash = await bcrypt.hash(String(password), 10);
+    const auth = {
+      email: String(email).toLowerCase().trim(),
+      passHash,
+      passwordSetAt: new Date().toISOString(),
+    };
+    licence.auth = auth;
+
+    const { rawRecord } = await jsonbinGetAll();
+    await jsonbinPutAll(Array.isArray(rawRecord) ? (list[idx]=licence, list) : licence);
+
+    const token = signToken({ licenceId: licence.id, email: auth.email });
+    res.json({ ok:true, token, licence: { ...licence, auth:{ email: auth.email, passwordSetAt: auth.passwordSetAt } } });
+  } catch (e) {
+    console.error('register error', e);
+    res.status(500).json({ ok:false, error:'SERVER_ERROR' });
+  }
+});
+
+
+app.post('/api/admin/auth/reset-password', requireAdminToken, async (req, res) => { /* ... */ });
+app.post('/api/admin/auth/clear-password', requireAdminToken, async (req, res) => { /* ... */ });
+app.post('/api/admin/auth/update-email', requireAdminToken, async (req, res) => { /* ... */ });
+app.get ('/api/admin/auth/status', requireAdminToken,  async (req, res) => { /* ... */ });
 
 // =======================
 //   Achat de crédits via GoCardless
