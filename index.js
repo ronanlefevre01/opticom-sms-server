@@ -1852,28 +1852,52 @@ app.post('/api/auth/set-password', burstLimiter, async (req, res) => {
   }
 });
 
-// POST /api/auth/login  { licenceId|cle, email, password }
+// POST /api/auth/login  { (optionnel: licenceId|cle), email, password }
 app.post('/api/auth/login', burstLimiter, async (req, res) => {
   try {
     const { licenceId, cle, email, password } = req.body || {};
-    if ((!licenceId && !cle) || !email || !password) {
+    if (!email || !password) {
       return res.status(400).json({ ok:false, error:'PARAMS' });
     }
-    const { licence } = await getLicenceByIdOrKey({ licenceId, cle });
-    if (!licence || !licence.auth?.passHash) {
+
+    const emailNorm = String(email).toLowerCase().trim();
+
+    let candidate = null;
+
+    if (licenceId || cle) {
+      // Chemin historique si on fournit encore une clé/id
+      const { licence } = await getLicenceByIdOrKey({ licenceId, cle });
+      candidate = licence || null;
+    }
+
+    if (!candidate) {
+      // Nouveau : recherche par email seul
+      const { list } = await jsonbinGetAll(true); // force dernier état
+      const matches = (list || []).filter(
+        (l) => l?.auth?.email && String(l.auth.email).toLowerCase() === emailNorm && l?.auth?.passHash
+      );
+      if (matches.length > 1) {
+        // on prend la plus “récente”
+        matches.sort((a,b) => new Date(b.updatedAt || b.dateCreation || 0) - new Date(a.updatedAt || a.dateCreation || 0));
+      }
+      candidate = matches[0] || null;
+    }
+
+    if (!candidate || !candidate.auth?.passHash) {
       return res.status(404).json({ ok:false, error:'AUTH_NOT_INITIALIZED' });
     }
-    const okEmail = String(licence.auth.email||'').toLowerCase() === String(email||'').toLowerCase();
-    const okPass  = await bcrypt.compare(String(password), String(licence.auth.passHash));
-    if (!okEmail || !okPass) return res.status(401).json({ ok:false, error:'BAD_CREDENTIALS' });
 
-    const token = signToken({ licenceId: licence.id, email: licence.auth.email });
-    res.json({ ok:true, token, licence });
+    const okPass = await bcrypt.compare(String(password), String(candidate.auth.passHash));
+    if (!okPass) return res.status(401).json({ ok:false, error:'BAD_CREDENTIALS' });
+
+    const token = signToken({ licenceId: candidate.id, email: candidate.auth.email });
+    return res.json({ ok:true, token, licence: candidate });
   } catch (e) {
     console.error('login error', e);
     res.status(500).json({ ok:false, error:'SERVER_ERROR' });
   }
 });
+
 
 // GET /api/auth/me   (Authorization: Bearer <token>)
 app.get('/api/auth/me', burstLimiter, async (req, res) => {
