@@ -1268,44 +1268,93 @@ function sanitizeCategorie(raw) {
 // ============================
 //   Envoi SMS (avec catégorie)
 // ============================
+/** --------- Helpers de normalisation --------- **/
+function toE164FR(raw) {
+  // autorise "06...", "+33...", "33...", "0033..."
+  let s = String(raw || '').trim();
+  s = s.replace(/[^\d+]/g, '');
+
+  // 00 -> +
+  if (s.startsWith('00')) s = '+' + s.slice(2);
+
+  // 33 sans '+' -> +33
+  if (/^33\d{9}$/.test(s)) s = '+' + s;
+
+  // 06XXXXXXXX -> +336XXXXXXXX
+  const mNat = s.match(/^0(\d{9})$/);
+  if (mNat) return '+33' + mNat[1];
+
+  // +33X......... -> standardise sans 0 après 33
+  if (s.startsWith('+33')) {
+    // enlève un éventuel 0 juste après +33
+    s = '+33' + s.slice(3).replace(/^0/, '');
+  }
+
+  return s;
+}
+
+/** Clé de rate-limit : licence + numéro FR "clé" (on enlève tout sauf chiffres) */
+function rateLimitKey(licenceId, e164) {
+  const digits = String(e164 || '').replace(/[^\d]/g, ''); // ex: +336... -> 336...
+  return `${licenceId}:${digits}`;
+}
+
+/** Récupération du champ catégorie peu importe son nom côté client */
+function pickCategory(body) {
+  return sanitizeCategorie(
+    body?.categorie ?? body?.category ?? body?.type ?? null
+  );
+}
+
+/** --------- Transactionnel --------- **/
 async function sendSmsTransactional(req, res) {
-  const { phoneNumber, message, licenceId, opticienId, categorie } = req.body || {};
+  const { phoneNumber, message, licenceId, opticienId } = req.body || {};
   if (!phoneNumber || !message || (!licenceId && !opticienId)) {
     return res.status(400).json({ success: false, error: 'Champs manquants.' });
   }
   if (!process.env.SMSMODE_LOGIN || !process.env.SMSMODE_PASSWORD) {
-    return res.status(500).json({ success: false, error: 'SMSMODE_LOGIN / SMSMODE_PASSWORD manquants.' });
+    return res
+      .status(500)
+      .json({ success: false, error: 'SMSMODE_LOGIN / SMSMODE_PASSWORD manquants.' });
   }
 
   try {
     const { list, rawRecord } = await jsonbinGetAll();
     const found = licenceId
-      ? findLicenceIndex(list, l => String(l.id) === String(licenceId))
-      : findLicenceIndex(list, l => String(l.opticien?.id) === String(opticienId));
-    if (found.idx === -1) return res.status(403).json({ success:false, error:'Licence introuvable.' });
+      ? findLicenceIndex(list, (l) => String(l.id) === String(licenceId))
+      : findLicenceIndex(list, (l) => String(l.opticien?.id) === String(opticienId));
+
+    if (found.idx === -1) {
+      return res.status(403).json({ success: false, error: 'Licence introuvable.' });
+    }
     const licence = found.licence;
 
     // Crédit requis si pas "Illimitée"
     if (licence.abonnement !== 'Illimitée') {
       const credits = Number(licence.credits || 0);
       if (!Number.isFinite(credits) || credits < 1) {
-        return res.status(403).json({ success:false, error:'Crédits insuffisants.' });
+        return res.status(403).json({ success: false, error: 'Crédits insuffisants.' });
       }
     }
 
-    const numero = toFRNumber(phoneNumber);
+    const numeroE164 = toE164FR(phoneNumber);
 
-    // Rate-limit par licence + numéro normalisé
-    const rlKey = `${licence.id}:${normalizeFR(numero)}`;
+    // Rate-limit par licence + numéro normalisé (E.164)
+    const rlKey = rateLimitKey(licence.id, numeroE164);
     const last = lastSent.get(rlKey) || 0;
     if (Date.now() - last < MIN_INTERVAL_MS) {
-      return res.status(429).json({ success:false, error:'Trop rapproché, réessayez dans quelques secondes.' });
+      return res
+        .status(429)
+        .json({ success: false, error: 'Trop rapproché, réessayez dans quelques secondes.' });
     }
     lastSent.set(rlKey, Date.now());
 
-    // Sender/signature fournis par le middleware applySenderAndSignature
+    // Expéditeur / signature injectés par le middleware
     const { sender, signature } = req.smsContext || {};
-    const finalMessage = buildFinalMessage(message, signature);
+    const finalMessage = buildFinalMessage(String(message || ''), signature || '');
+    if (!finalMessage.trim()) {
+      return res.status(400).json({ success: false, error: 'Message vide.' });
+    }
 
     // Envoi SMSMode
     const params = new URLSearchParams();
@@ -1315,62 +1364,67 @@ async function sendSmsTransactional(req, res) {
     params.append('unicode', '1');
     params.append('charset', 'UTF-8');
     params.append('smslong', '1');
-    params.append('numero', numero);
-    params.append('emetteur', sender);
+    params.append('numero', numeroE164);       // ✅ on envoie E.164
+    params.append('emetteur', sender || 'OPTICOM');
 
     const smsResp = await fetch('https://api.smsmode.com/http/1.6/sendSMS.do', {
-      method:'POST',
-      headers:{ 'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8' },
-      body: params.toString()
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
+      body: params.toString(),
     });
     const smsText = await smsResp.text();
 
     const smsHasError =
       !smsResp.ok || /^32\s*\|/i.test(smsText) || /^35\s*\|/i.test(smsText) || /\berror\b/i.test(smsText);
     if (smsHasError) {
-      return res.status(502).json({ success:false, error:`Erreur SMSMode: ${smsText}` });
+      return res.status(502).json({ success: false, error: `Erreur SMSMode: ${smsText}` });
     }
 
-    // Décrément crédit après succès
+    // Décrément crédit après succès (si pas illimitée)
     if (licence.abonnement !== 'Illimitée') {
       licence.credits = Math.max(0, Number(licence.credits || 0) - 1);
     }
 
-    // Log avec catégorie libre
+    // Log avec catégorie (peu importe le nom reçu)
+    const categorie = pickCategory(req.body);
     await appendSmsLogAndPersist({
-      list, rawRecord, idx: found.idx, licence,
+      list,
+      rawRecord,
+      idx: found.idx,
+      licence,
       entry: {
         date: new Date().toISOString(),
-        type: sanitizeCategorie(categorie), // <= "lunettes", "lentilles", "sav", "noel", ...
-        numero,
+        type: categorie,                 // ex. 'Lunettes', 'Lentilles', 'SAV', 'Commande', 'Noël', etc.
+        numero: numeroE164,
         emetteur: sender,
         textHash: sha256Hex(finalMessage),
         provider: 'smsmode',
         bytes: Buffer.byteLength(finalMessage, 'utf8'),
-        mois: ymKey(new Date())
-      }
+        mois: ymKey(new Date()),
+      },
     });
 
     return res.json({
-      success:true,
+      success: true,
       licenceId: licence.id,
       credits: licence.credits,
       abonnement: licence.abonnement,
       sender,
       message: finalMessage,
-      categorie: sanitizeCategorie(categorie)
+      categorie,
     });
   } catch (err) {
     console.error('Erreur /send-sms:', err);
-    res.status(500).json({ success:false, error:String(err.message || err) });
+    res.status(500).json({ success: false, error: String(err.message || err) });
   }
 }
 
 app.post('/send-sms', applySenderAndSignature, sendSmsTransactional);
 app.post('/send-transactional', applySenderAndSignature, sendSmsTransactional);
 
+/** --------- Promotionnel (marketing) --------- **/
 app.post('/send-promotional', applySenderAndSignature, async (req, res) => {
-  const { phoneNumber, message, licenceId, opticienId, marketingConsent, categorie } = req.body || {};
+  const { phoneNumber, message, licenceId, opticienId, marketingConsent } = req.body || {};
 
   if (!phoneNumber || (!licenceId && !opticienId)) {
     return res.status(400).json({ success: false, error: 'Champs manquants.' });
@@ -1390,12 +1444,12 @@ app.post('/send-promotional', applySenderAndSignature, async (req, res) => {
     }
     const licence = found.licence;
 
-    const numero = toFRNumber(phoneNumber);
+    const numeroE164 = toE164FR(phoneNumber);
 
-    // Consentement marketing requis
+    // Consentement marketing requis (licence, global ou explicite dans la requête)
     const hasConsent =
       marketingConsent === true ||
-      (Array.isArray(licence.consents) && licence.consents.includes(numero)) ||
+      (Array.isArray(licence.consents) && licence.consents.includes(numeroE164)) ||
       licence.marketingConsentGlobal === true;
 
     if (!hasConsent) {
@@ -1403,21 +1457,26 @@ app.post('/send-promotional', applySenderAndSignature, async (req, res) => {
     }
 
     // Opt-out vérifié
-    if (isOptedOut(licence, numero)) {
+    if (isOptedOut(licence, numeroE164)) {
       return res.status(403).json({ success: false, error: 'DESTINATAIRE_DESINSCRIT' });
     }
 
-    // Rate-limit par licence + numéro normalisé
-    const rlKey = `${licence.id}:${normalizeFR(numero)}`;
+    // Rate-limit
+    const rlKey = rateLimitKey(licence.id, numeroE164);
     const last = lastSent.get(rlKey) || 0;
     if (Date.now() - last < MIN_INTERVAL_MS) {
-      return res.status(429).json({ success: false, error: 'Trop rapproché, réessayez dans quelques secondes.' });
+      return res
+        .status(429)
+        .json({ success: false, error: 'Trop rapproché, réessayez dans quelques secondes.' });
     }
     lastSent.set(rlKey, Date.now());
 
     const { sender, signature } = req.smsContext || {};
-    const baseText = buildFinalMessage(message || '', signature || '');
-    const finalMessage = ensureStopMention(baseText); // STOP au 36111
+    const baseText = buildFinalMessage(String(message || ''), signature || '');
+    const finalMessage = ensureStopMention(baseText); // “STOP au 36111”
+    if (!finalMessage.trim()) {
+      return res.status(400).json({ success: false, error: 'Message vide.' });
+    }
 
     // Envoi SMSMode
     const params = new URLSearchParams();
@@ -1427,13 +1486,13 @@ app.post('/send-promotional', applySenderAndSignature, async (req, res) => {
     params.append('unicode', '1');
     params.append('charset', 'UTF-8');
     params.append('smslong', '1');
-    params.append('numero', numero);
-    params.append('emetteur', sender);
+    params.append('numero', numeroE164);      // ✅ E.164
+    params.append('emetteur', sender || 'OPTICOM');
 
     const smsResp = await fetch('https://api.smsmode.com/http/1.6/sendSMS.do', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
-      body: params.toString()
+      body: params.toString(),
     });
     const smsText = await smsResp.text();
 
@@ -1443,12 +1502,13 @@ app.post('/send-promotional', applySenderAndSignature, async (req, res) => {
       return res.status(502).json({ success: false, error: `Erreur SMSMode: ${smsText}` });
     }
 
-    // Décrément crédit après succès (si pas illimitée)
+    // Décrément crédit après succès
     if (licence.abonnement !== 'Illimitée') {
       licence.credits = Math.max(0, Number(licence.credits || 0) - 1);
     }
 
-    // Log avec catégorie libre
+    // Log catégorie
+    const categorie = pickCategory(req.body);
     await appendSmsLogAndPersist({
       list,
       rawRecord,
@@ -1456,14 +1516,14 @@ app.post('/send-promotional', applySenderAndSignature, async (req, res) => {
       licence,
       entry: {
         date: new Date().toISOString(),
-        type: sanitizeCategorie(categorie), // <= "noel", "été", "lunettes", ...
-        numero,
+        type: categorie,
+        numero: numeroE164,
         emetteur: sender,
         textHash: sha256Hex(finalMessage),
         provider: 'smsmode',
         bytes: Buffer.byteLength(finalMessage, 'utf8'),
-        mois: ymKey(new Date())
-      }
+        mois: ymKey(new Date()),
+      },
     });
 
     return res.json({
@@ -1472,7 +1532,7 @@ app.post('/send-promotional', applySenderAndSignature, async (req, res) => {
       sender,
       message: finalMessage,
       credits: licence.credits,
-      categorie: sanitizeCategorie(categorie)
+      categorie,
     });
   } catch (err) {
     console.error('Erreur /send-promotional:', err);
