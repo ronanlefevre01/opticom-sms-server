@@ -2190,7 +2190,11 @@ async function findLicence({ cle, id }) {
 }
 
 // 👇 burst limiter sur endpoints sensibles
-app.use(['/api/clients', '/api/licence', '/licence', '/api/licence/by-key', '/licence/by-key', '/licence-by-key'], burstLimiter);
+// Limiter seulement les lectures (GET) pour éviter de bloquer les upserts
+app.use(['/api/licence', '/licence', '/api/licence/by-key', '/licence/by-key', '/licence-by-key'], burstLimiter);
+// /api/clients : limiter uniquement le GET (la synchro fait un POST + GET)
+app.get('/api/clients', burstLimiter);
+
 
 app.get(
   ['/api/licence/by-key', '/licence/by-key', '/licence-by-key', '/api/licence', '/licence'],
