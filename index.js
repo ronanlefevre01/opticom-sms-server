@@ -17,6 +17,25 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const JWT_SECRET = process.env.JWT_SECRET || 'change-me-super-secret';
 
+// === Admin (OptiAdmin) – Auth dédiée ===
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL || '';        // ex: admin@opticom.fr
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';  // ex: très long, stocké en env
+const ADMIN_JWT_SECRET = process.env.ADMIN_JWT_SECRET || JWT_SECRET;
+
+function signAdmin(payload, expiresIn = '12h') {
+  return jwt.sign(payload, ADMIN_JWT_SECRET, { algorithm: 'HS256', expiresIn });
+}
+function verifyAdmin(token) {
+  try { return jwt.verify(token, ADMIN_JWT_SECRET); } catch { return null; }
+}
+function requireAdmin(req, res, next) {
+  const auth = (req.get('authorization') || '').split(' ')[1] || '';
+  const dec = verifyAdmin(auth);
+  if (!dec || dec.role !== 'admin') return res.status(401).json({ error: 'unauthorized' });
+  next();
+}
+
+
 
 // --- Routes/Services externes existants
 const licenceRoutes = require('./routes/licence.routes');
@@ -2033,6 +2052,73 @@ app.post('/api/admin/auth/reset-password', requireAdminToken, async (req, res) =
 app.post('/api/admin/auth/clear-password', requireAdminToken, async (req, res) => { /* ... */ });
 app.post('/api/admin/auth/update-email', requireAdminToken, async (req, res) => { /* ... */ });
 app.get ('/api/admin/auth/status', requireAdminToken,  async (req, res) => { /* ... */ });
+
+// === OptiAdmin: login admin (retourne un JWT admin)
+app.post('/api/admin/login', burstLimiter, (req, res) => {
+  const { email, password } = req.body || {};
+  if (!ADMIN_EMAIL || !ADMIN_PASSWORD) {
+    return res.status(500).json({ error: 'ADMIN_CREDS_MISSING' });
+  }
+  const ok =
+    String(email || '').toLowerCase().trim() === String(ADMIN_EMAIL).toLowerCase().trim() &&
+    String(password || '') === String(ADMIN_PASSWORD);
+
+  if (!ok) return res.status(401).json({ error: 'BAD_CREDENTIALS' });
+
+  const token = signAdmin({ role: 'admin', email: ADMIN_EMAIL });
+  res.json({ ok: true, token });
+});
+
+// (optionnel) vérifier le token admin
+app.get('/api/admin/me', requireAdmin, (req, res) => {
+  res.json({ ok: true, role: 'admin' });
+});
+
+// Tous les endpoints sous /api/admin/secure/* nécessitent le JWT admin
+app.use('/api/admin/secure', requireAdmin);
+
+// Liste complète des licences (vue OptiAdmin)
+app.get('/api/admin/secure/licences', async (_req, res) => {
+  try {
+    const { list } = await jsonbinGetAll();
+    res.json({ items: list || [] });
+  } catch (e) {
+    console.error('admin licences error', e);
+    res.status(500).json({ error: 'SERVER_ERROR' });
+  }
+});
+
+// Lecture d’une licence précise
+app.get('/api/admin/secure/licence/:id', async (req, res) => {
+  try {
+    const { list } = await jsonbinGetAll();
+    const { idx, licence } = findLicenceIndex(list, l => String(l.id) === String(req.params.id));
+    if (idx === -1 || !licence) return res.status(404).json({ error: 'NOT_FOUND' });
+    res.json({ licence });
+  } catch (e) {
+    console.error('admin licence read error', e);
+    res.status(500).json({ error: 'SERVER_ERROR' });
+  }
+});
+
+// Patch “admin” (autorise tout, y compris champs protégés si tu le souhaites)
+app.post('/api/admin/secure/licence/:id/sync', async (req, res) => {
+  try {
+    const { patch = {} } = req.body || {};
+    const { list, rawRecord } = await jsonbinGetAll();
+    const { idx, licence } = findLicenceIndex(list, l => String(l.id) === String(req.params.id));
+    if (idx === -1 || !licence) return res.status(404).json({ error: 'NOT_FOUND' });
+
+    // ⚠️ Admin : merge sans strip (tu peux restreindre via une whitelist si besoin)
+    const updated = { ...licence, ...patch, updatedAt: new Date().toISOString() };
+    const body = Array.isArray(rawRecord) ? (list[idx] = updated, list) : updated;
+    await jsonbinPutAll(body);
+    res.json({ ok: true, licence: updated });
+  } catch (e) {
+    console.error('admin licence sync error', e);
+    res.status(500).json({ error: 'SERVER_ERROR' });
+  }
+});
 
 // =======================
 //   Achat de crédits via GoCardless
