@@ -2053,8 +2053,8 @@ app.post('/api/admin/auth/clear-password', requireAdminToken, async (req, res) =
 app.post('/api/admin/auth/update-email', requireAdminToken, async (req, res) => { /* ... */ });
 app.get ('/api/admin/auth/status', requireAdminToken,  async (req, res) => { /* ... */ });
 
-// === OptiAdmin: login admin (retourne un JWT admin)
-app.post('/api/admin/login', burstLimiter, (req, res) => {
+// === Opti: login admin (retourne un JWT admin)
+app.post('/admin/login', burstLimiter, (req, res) => {
   const { email, password } = req.body || {};
   if (!ADMIN_EMAIL || !ADMIN_PASSWORD) {
     return res.status(500).json({ error: 'ADMIN_CREDS_MISSING' });
@@ -2070,7 +2070,7 @@ app.post('/api/admin/login', burstLimiter, (req, res) => {
 });
 
 // (optionnel) vérifier le token admin
-app.get('/api/admin/me', requireAdmin, (req, res) => {
+app.get('/admin/me', requireAdmin, (req, res) => {
   res.json({ ok: true, role: 'admin' });
 });
 
