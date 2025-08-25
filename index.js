@@ -2120,70 +2120,77 @@ app.post('/api/admin/secure/licence/:id/sync', async (req, res) => {
   }
 });
 
-// DELETE licence (admin) — supprime vraiment de JSONBin
-// 1) Par ID:        DELETE /api/admin/secure/licences/:id
-//                   DELETE /api/admin/secure/licence/:id    // alias
-// 2) Par clé (cle): DELETE /api/admin/secure/licences?cle=XXXX
-//                   DELETE /api/admin/secure/licence?cle=XXXX
-app.delete(
-  [
-    '/api/admin/secure/licences/:id',
-    '/api/admin/secure/licences',
-    '/api/admin/secure/licence/:id', // alias singulier
-    '/api/admin/secure/licence',     // alias singulier
-  ],
-  requireAdmin,
-  async (req, res) => {
-    try {
-      const rawId = (req.params?.id || '').trim();
-      const rawCle = (req.query?.cle || '').toString().trim();
+async function loadOpticomListFromJsonbin() {
+  const r = await fetch(`${JSONBIN_BASE}/b/${BIN_ID}/latest`, {
+    headers: { 'X-Master-Key': JSONBIN_MASTER_KEY, 'X-Bin-Meta': 'false' }
+  });
+  if (!r.ok) throw new Error(`JSONBIN_GET_${r.status}`);
+  const j = await r.json();
+  return j.record || [];
+}
 
-      if (!rawId && !rawCle) {
-        return res.status(400).json({ ok: false, error: 'PARAMS' });
-      }
-
-      const NK = (s) => String(s || '').replace(/[\s-]/g, '').toUpperCase();
-
-      const result = await withJsonbinUpdate(async ({ list }) => {
-        let idx = -1;
-
-        if (rawId) {
-          const idNK = NK(rawId);
-          idx = list.findIndex((l) =>
-            String(l.id) === rawId ||                     // id exact
-            NK(l.licence || l.cle || l.key) === idNK ||   // clé passée dans :id
-            String(l.opticien?.id) === rawId              // opticien.id
-          );
-        } else if (rawCle) {
-          const keyNK = NK(rawCle);
-          idx = list.findIndex((l) => NK(l.licence || l.cle || l.key) === keyNK);
-        }
-
-        if (idx === -1) {
-          return { __skipSave: true, status: 404, error: 'LICENCE_NOT_FOUND' };
-        }
-
-        const removed = list.splice(idx, 1)[0]; // ✅ suppression réelle
-        return {
-          removedId:  removed?.id || null,
-          removedKey: removed?.licence || removed?.cle || null,
-        };
-      });
-
-      if (result?.status === 404) {
-        return res.status(404).json({ ok: false, error: 'LICENCE_NOT_FOUND' });
-      }
-      return res.json({
-        ok: true,
-        removedId: result.removedId,
-        removedKey: result.removedKey,
-      });
-    } catch (e) {
-      console.error('admin delete licence error', e);
-      return res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
-    }
+async function saveOpticomListToJsonbin(list) {
+  const r = await fetch(`${JSONBIN_BASE}/b/${BIN_ID}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', 'X-Master-Key': JSONBIN_MASTER_KEY },
+    body: JSON.stringify(list)
+  });
+  if (!r.ok) {
+    const t = await r.text().catch(()=> '');
+    throw new Error(`JSONBIN_PUT_${r.status} ${t}`);
   }
-);
+}
+
+
+// CORS préflight spécifique (utile pour DELETE + Authorization)
+app.options(['/api/admin/secure/licences', '/api/admin/secure/licences/:id'], (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', process.env.ADMIN_ORIGIN || '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.status(204).end();
+});
+
+// DELETE licence (admin) — par ID OU par clé
+// 1) DELETE /api/admin/secure/licences/:id
+// 2) DELETE /api/admin/secure/licences?cle=XXXX
+app.delete(['/api/admin/secure/licences/:id', '/api/admin/secure/licences'], requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params || {};
+    const { cle } = req.query || {};
+
+    // 1) Charger la liste JSONBin
+    const list = await loadOpticomListFromJsonbin(); // => tableau
+    if (!Array.isArray(list)) throw new Error('LIST_NOT_ARRAY');
+
+    // 2) Trouver l’index à supprimer
+    const norm = (s='') => String(s).trim().toLowerCase();
+    const keyToMatch = cle ? norm(cle) : null;
+
+    let idx = -1;
+    if (id) {
+      idx = list.findIndex(l => String(l?.id || l?.opticien?.id || l?.licence) === String(id));
+    } else if (keyToMatch) {
+      idx = list.findIndex(l => norm(l?.licence || l?.cle || l?.key || '') === keyToMatch);
+    }
+
+    if (idx === -1) {
+      return res.status(404).json({ ok: false, error: 'LICENCE_NOT_FOUND' });
+    }
+
+    // 3) Supprimer + sauvegarder
+    const [removed] = list.splice(idx, 1);
+    await saveOpticomListToJsonbin(list);
+
+    return res.json({
+      ok: true,
+      removedId: removed?.id || null,
+      removedKey: removed?.licence || removed?.cle || null,
+    });
+  } catch (e) {
+    console.error('admin delete licence error', e);
+    return res.status(500).json({ ok: false, error: 'SERVER_ERROR', details: e?.message });
+  }
+});
 
 
 // =======================
