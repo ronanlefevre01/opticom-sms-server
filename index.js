@@ -2121,42 +2121,69 @@ app.post('/api/admin/secure/licence/:id/sync', async (req, res) => {
 });
 
 // DELETE licence (admin) — supprime vraiment de JSONBin
-// 1) Par ID :        DELETE /api/admin/secure/licences/:id
-// 2) Par clé (cle) : DELETE /api/admin/secure/licences?cle=XXXX
-app.delete(['/api/admin/secure/licences/:id', '/api/admin/secure/licences'], requireAdmin, async (req, res) => {
-  try {
-    const { id } = req.params || {};
-    const { cle } = req.query || {};
+// 1) Par ID:        DELETE /api/admin/secure/licences/:id
+//                   DELETE /api/admin/secure/licence/:id    // alias
+// 2) Par clé (cle): DELETE /api/admin/secure/licences?cle=XXXX
+//                   DELETE /api/admin/secure/licence?cle=XXXX
+app.delete(
+  [
+    '/api/admin/secure/licences/:id',
+    '/api/admin/secure/licences',
+    '/api/admin/secure/licence/:id', // alias singulier
+    '/api/admin/secure/licence',     // alias singulier
+  ],
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const rawId = (req.params?.id || '').trim();
+      const rawCle = (req.query?.cle || '').toString().trim();
 
-    const result = await withJsonbinUpdate(({ list }) => {
-      let idx = -1;
-      if (id) {
-        const found = findLicenceIndex(list, l => String(l.id) === String(id));
-        idx = found.idx;
-      } else if (cle) {
-        const key = normKey(cle);
-        const found = findLicenceIndex(list, l => normKey(l.licence || l.cle || l.key || '') === key);
-        idx = found.idx;
+      if (!rawId && !rawCle) {
+        return res.status(400).json({ ok: false, error: 'PARAMS' });
       }
 
-      if (idx === -1) return { __skipSave: true, status: 404, error: 'LICENCE_NOT_FOUND' };
+      const NK = (s) => String(s || '').replace(/[\s-]/g, '').toUpperCase();
 
-      const removed = list.splice(idx, 1)[0]; // ✅ suppression réelle dans l’array
-      return {
-        removedId: removed?.id || null,
-        removedKey: removed?.licence || removed?.cle || null,
-      };
-    });
+      const result = await withJsonbinUpdate(async ({ list }) => {
+        let idx = -1;
 
-    if (result?.status === 404) {
-      return res.status(404).json({ ok: false, error: 'LICENCE_NOT_FOUND' });
+        if (rawId) {
+          const idNK = NK(rawId);
+          idx = list.findIndex((l) =>
+            String(l.id) === rawId ||                     // id exact
+            NK(l.licence || l.cle || l.key) === idNK ||   // clé passée dans :id
+            String(l.opticien?.id) === rawId              // opticien.id
+          );
+        } else if (rawCle) {
+          const keyNK = NK(rawCle);
+          idx = list.findIndex((l) => NK(l.licence || l.cle || l.key) === keyNK);
+        }
+
+        if (idx === -1) {
+          return { __skipSave: true, status: 404, error: 'LICENCE_NOT_FOUND' };
+        }
+
+        const removed = list.splice(idx, 1)[0]; // ✅ suppression réelle
+        return {
+          removedId:  removed?.id || null,
+          removedKey: removed?.licence || removed?.cle || null,
+        };
+      });
+
+      if (result?.status === 404) {
+        return res.status(404).json({ ok: false, error: 'LICENCE_NOT_FOUND' });
+      }
+      return res.json({
+        ok: true,
+        removedId: result.removedId,
+        removedKey: result.removedKey,
+      });
+    } catch (e) {
+      console.error('admin delete licence error', e);
+      return res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
     }
-    return res.json({ ok: true, removedId: result.removedId, removedKey: result.removedKey });
-  } catch (e) {
-    console.error('admin delete licence error', e);
-    return res.status(500).json({ ok:false, error:'SERVER_ERROR' });
   }
-});
+);
 
 
 // =======================
