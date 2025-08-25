@@ -2150,47 +2150,58 @@ app.options(['/api/admin/secure/licences', '/api/admin/secure/licences/:id'], (r
   res.status(204).end();
 });
 
-// DELETE licence (admin) — par ID OU par clé
-// 1) DELETE /api/admin/secure/licences/:id
-// 2) DELETE /api/admin/secure/licences?cle=XXXX
-app.delete(['/api/admin/secure/licences/:id', '/api/admin/secure/licences'], requireAdmin, async (req, res) => {
-  try {
-    const { id } = req.params || {};
-    const { cle } = req.query || {};
+// DELETE licence (admin)
+// 1) Par ID path:  DELETE /api/admin/secure/licences/:id
+//    -> on tente sur id, licence, cle, opticien.id
+// 2) Par clé query: DELETE /api/admin/secure/licences?cle=XXXX
+app.delete(
+  ['/api/admin/secure/licences/:id', '/api/admin/secure/licences'],
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const { id } = req.params || {};
+      const { cle } = req.query || {};
 
-    // 1) Charger la liste JSONBin
-    const list = await loadOpticomListFromJsonbin(); // => tableau
-    if (!Array.isArray(list)) throw new Error('LIST_NOT_ARRAY');
+      const result = await withJsonbinUpdate(({ list }) => {
+        const norm = (v) => (v == null ? '' : String(v).trim().toLowerCase());
 
-    // 2) Trouver l’index à supprimer
-    const norm = (s='') => String(s).trim().toLowerCase();
-    const keyToMatch = cle ? norm(cle) : null;
+        let idx = -1;
 
-    let idx = -1;
-    if (id) {
-      idx = list.findIndex(l => String(l?.id || l?.opticien?.id || l?.licence) === String(id));
-    } else if (keyToMatch) {
-      idx = list.findIndex(l => norm(l?.licence || l?.cle || l?.key || '') === keyToMatch);
+        if (id) {
+          const key = String(id).trim();
+          idx = list.findIndex((l) =>
+            String(l?.id) === key ||
+            String(l?.licence) === key ||
+            String(l?.cle) === key ||
+            String(l?.opticien?.id) === key
+          );
+        } else if (cle) {
+          const key = norm(cle);
+          idx = list.findIndex((l) =>
+            norm(l?.licence) === key || norm(l?.cle) === key
+          );
+        }
+
+        if (idx === -1) return { __skipSave: true, status: 404, error: 'LICENCE_NOT_FOUND' };
+
+        const [removed] = list.splice(idx, 1); // suppression réelle
+        return {
+          removedId: removed?.id ?? null,
+          removedKey: removed?.licence ?? removed?.cle ?? null,
+        };
+      });
+
+      if (result?.status === 404) {
+        return res.status(404).json({ ok: false, error: 'LICENCE_NOT_FOUND' });
+      }
+      return res.json({ ok: true, removedId: result.removedId, removedKey: result.removedKey });
+    } catch (e) {
+      console.error('admin delete licence error', e);
+      return res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
     }
-
-    if (idx === -1) {
-      return res.status(404).json({ ok: false, error: 'LICENCE_NOT_FOUND' });
-    }
-
-    // 3) Supprimer + sauvegarder
-    const [removed] = list.splice(idx, 1);
-    await saveOpticomListToJsonbin(list);
-
-    return res.json({
-      ok: true,
-      removedId: removed?.id || null,
-      removedKey: removed?.licence || removed?.cle || null,
-    });
-  } catch (e) {
-    console.error('admin delete licence error', e);
-    return res.status(500).json({ ok: false, error: 'SERVER_ERROR', details: e?.message });
   }
-});
+);
+
 
 
 // =======================
